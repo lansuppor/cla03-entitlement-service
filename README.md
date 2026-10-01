@@ -1,6 +1,6 @@
 # Entitlement service
 
-Go HTTP service for team service entitlements: seat-quota grants with idempotent reservations, confirm/release settlement, and corrective reversals of confirmed reservations, persisted in PostgreSQL. Requires Go 1.27.1 and PostgreSQL 18.6.
+Go HTTP service for team service entitlements: seat-quota grants with idempotent reservations, confirm/release settlement, corrective reversals of confirmed reservations, and scheduled quota-total adjustments, persisted in PostgreSQL. Requires Go 1.27.1 and PostgreSQL 18.6.
 
 ```sh
 go mod download
@@ -66,29 +66,44 @@ When operations discovers a confirmed reservation was recorded by mistake, a rev
 
 The reversal response and the entitlement's reservation list both describe the reversal with its own identifier, amount, status `reversed`, and creation and settlement timestamps; the original reservation and its confirmation record stay untouched and remain visible alongside it.
 
+### Adjust the quota total
+
+`POST /entitlements/{entitlement_id}/adjustments`
+
+```json
+{"adjustment_id":"upsell-2026-0042","delta":50,"effective_at":"2026-06-01T00:00:00Z"}
+```
+
+When a customer buys more seats, is granted bonus quota, or has quota clawed back, operations registers an adjustment against the existing entitlement. `delta` is a non-zero integer: positive grows the quota total, negative shrinks it. `effective_at` is the moment the adjustment starts counting toward the quota total. `adjustment_id` is the caller-supplied business identifier, unique within the entitlement. The first submission returns 201 with the adjustment. Resubmitting the same identifier with the same delta and effective time returns 200 with the original adjustment and does not change any quota; resubmitting it with a different delta or effective time fails with 409 `adjustment_param_mismatch` and changes nothing. A zero or missing `delta` or a malformed `effective_at` fails with 400 `invalid_request`.
+
+Before `effective_at` the adjustment is recorded with status `pending`, is listed in the entitlement view, and does not change the quota total. Once the effective time has arrived the adjustment is folded into `quota_total` exactly once — by the next operation or query on the entitlement — and reported with status `applied` and its `applied_at` timestamp; service restarts and late duplicate requests can neither apply it twice nor lose it. An increase always applies. A decrease applies only while the adjusted total still covers used plus unsettled quota: if occupied quota exceeds the adjusted total, the decrease stays `pending` (visible as such in the view) and takes effect automatically, in full and exactly once, once occupancy allows — it is never partially applied, and used plus unsettled quota never exceeds the current total. A decrease that would drop the current quota total to zero or below fails with 422 `insufficient_quota` and writes nothing.
+
 ### Query an entitlement
 
-`GET /entitlements/{entitlement_id}` returns 200 with the quota breakdown and reservation list:
+`GET /entitlements/{entitlement_id}` returns 200 with the quota breakdown, reservation list and adjustment list:
 
 ```json
 {
   "entitlement_id": "team-alpha",
   "seats_total": 100,
-  "quota_total": 100,
+  "quota_total": 150,
   "used_amount": 0,
   "reserved_amount": 0,
-  "available_amount": 100,
+  "available_amount": 150,
   "status": "active",
   "valid_from": "2026-01-01T00:00:00Z",
   "valid_to": "2027-01-01T00:00:00Z",
   "reservations": [
     {"reservation_id": "sub-a-001", "amount": 30, "status": "confirmed", "settled_at": "...", "created_at": "..."},
     {"reservation_id": "corr-2026-0001", "amount": 30, "status": "reversed", "settled_at": "...", "created_at": "..."}
+  ],
+  "adjustments": [
+    {"adjustment_id": "upsell-2026-0042", "delta": 50, "effective_at": "2026-06-01T00:00:00Z", "status": "applied", "applied_at": "...", "created_at": "..."}
   ]
 }
 ```
 
-`status` is `pending`, `active` or `expired` relative to the validity window. Each entry reports its business identifier, amount, lifecycle status (`pending`, `confirmed`, `released` for reservations; `reversed` for corrective reversals) and settlement timestamp. `used_amount` is confirmed quota minus effective reversals, so a reversed reservation leaves the original confirmation and the reversal both visible while the quota figures reflect only the net effect.
+`status` is `pending`, `active` or `expired` relative to the validity window. Each reservation entry reports its business identifier, amount, lifecycle status (`pending`, `confirmed`, `released` for reservations; `reversed` for corrective reversals) and settlement timestamp. `used_amount` is confirmed quota minus effective reversals, so a reversed reservation leaves the original confirmation and the reversal both visible while the quota figures reflect only the net effect. Each adjustment entry reports its business identifier, delta, effective time and whether it is `pending` or `applied`; `quota_total`, `available_amount` and the other figures count only applied adjustments, so they always match the quota actually in force.
 
 ### Error codes
 
@@ -104,10 +119,11 @@ The reversal response and the entitlement's reservation list both describe the r
 | `reservation_already_settled` | 409 | Reservation was already confirmed or released |
 | `reservation_not_confirmed` | 422 | Reservation is not confirmed, so it cannot be reversed |
 | `reservation_already_reversed` | 409 | Reservation was already reversed |
+| `adjustment_param_mismatch` | 409 | Adjustment identifier reused with a different delta or effective time |
 
 ## Consistency
 
-Concurrent reservations, confirmations, releases and reversals on the same entitlement are serialized with a row lock in PostgreSQL, so used quota plus unsettled reservations never exceeds the total quota, repeated requests never grant or refund quota twice, and failed requests leave no partial results. All state lives in PostgreSQL, so a restart preserves every quota figure, reservation status and reversal record.
+Concurrent reservations, confirmations, releases, reversals and adjustments on the same entitlement are serialized with a row lock in PostgreSQL, so used quota plus unsettled reservations never exceeds the total quota, repeated requests never grant, refund or adjust quota twice, and failed requests leave no partial results. Due adjustments are folded into the quota total inside the same lock — by whichever operation or query touches the entitlement first after the effective time — so every adjustment applies exactly once and a decrease never crowds out occupied quota. All state lives in PostgreSQL, so a restart preserves every quota figure, reservation status, reversal record and adjustment record including its applied or pending state.
 
 The local setup uses a trusted loopback connection and C collation without ICU. Use separate database directories, database ports and HTTP ports when running multiple copies.
 
@@ -129,4 +145,35 @@ curl -s 127.0.0.1:8080/entitlements/team-alpha
 curl -s -X POST 127.0.0.1:8080/entitlements/team-alpha/reservations/sub-a-001/reverse -d '{"reversal_id":"corr-2026-0001"}'   # 200, original reversal
 curl -s -X POST 127.0.0.1:8080/entitlements/team-alpha/reservations/sub-a-001/reverse -d '{"reversal_id":"corr-2026-0002"}'   # 409 reservation_already_reversed
 curl -s -X POST 127.0.0.1:8080/entitlements/team-alpha/reservations/sub-a-404/reverse -d '{"reversal_id":"corr-2026-0003"}'   # 404 reservation_not_found
+```
+
+## Verifying the adjustment flow
+
+With the server running as above, the full adjustment cycle can be exercised with curl:
+
+```sh
+# Create an entitlement and occupy 80 of 100 seats (60 confirmed, 20 reserved).
+curl -s -X POST 127.0.0.1:8080/entitlements -d '{"entitlement_id":"team-beta","quota_total":100,"valid_from":"2026-01-01T00:00:00Z","valid_to":"2027-01-01T00:00:00Z"}'
+curl -s -X POST 127.0.0.1:8080/entitlements/team-beta/reservations -d '{"reservation_id":"sub-b-001","amount":60}'
+curl -s -X POST 127.0.0.1:8080/entitlements/team-beta/reservations/sub-b-001/confirm
+curl -s -X POST 127.0.0.1:8080/entitlements/team-beta/reservations -d '{"reservation_id":"sub-b-002","amount":20}'
+
+# An increase due in the past applies immediately: quota_total becomes 150.
+curl -s -X POST 127.0.0.1:8080/entitlements/team-beta/adjustments -d '{"adjustment_id":"upsell-001","delta":50,"effective_at":"2026-01-01T00:00:00Z"}'
+curl -s 127.0.0.1:8080/entitlements/team-beta
+
+# A decrease to 50 is due but 80 seats are occupied: it stays pending.
+curl -s -X POST 127.0.0.1:8080/entitlements/team-beta/adjustments -d '{"adjustment_id":"clawback-001","delta":-100,"effective_at":"2026-01-01T00:00:00Z"}'
+curl -s 127.0.0.1:8080/entitlements/team-beta   # quota_total still 150, adjustment listed as pending
+
+# Free the occupancy; the pending decrease applies automatically, exactly once.
+curl -s -X POST 127.0.0.1:8080/entitlements/team-beta/reservations/sub-b-002/release
+curl -s -X POST 127.0.0.1:8080/entitlements/team-beta/reservations/sub-b-001/reverse -d '{"reversal_id":"corr-b-001"}'
+curl -s 127.0.0.1:8080/entitlements/team-beta   # quota_total now 50, adjustment applied
+
+# Replays and illegal adjustments are safe no-ops with stable error codes.
+curl -s -X POST 127.0.0.1:8080/entitlements/team-beta/adjustments -d '{"adjustment_id":"upsell-001","delta":50,"effective_at":"2026-01-01T00:00:00Z"}'   # 200, original adjustment
+curl -s -X POST 127.0.0.1:8080/entitlements/team-beta/adjustments -d '{"adjustment_id":"upsell-001","delta":60,"effective_at":"2026-01-01T00:00:00Z"}'   # 409 adjustment_param_mismatch
+curl -s -X POST 127.0.0.1:8080/entitlements/team-beta/adjustments -d '{"adjustment_id":"clawback-002","delta":-50,"effective_at":"2026-01-01T00:00:00Z"}' # 422 insufficient_quota (total would reach 0)
+curl -s -X POST 127.0.0.1:8080/entitlements/team-beta/adjustments -d '{"adjustment_id":"clawback-003","delta":0,"effective_at":"2026-01-01T00:00:00Z"}'   # 400 invalid_request
 ```

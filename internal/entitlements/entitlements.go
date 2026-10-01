@@ -29,6 +29,7 @@ const (
 	CodeReservationSettled      = "reservation_already_settled"
 	CodeReservationNotConfirmed = "reservation_not_confirmed"
 	CodeReservationReversed     = "reservation_already_reversed"
+	CodeAdjustmentParamChanged  = "adjustment_param_mismatch"
 )
 
 // Error is a domain failure with a stable machine-readable code.
@@ -43,12 +44,14 @@ func fail(code, format string, args ...any) *Error {
 	return &Error{Code: code, Message: fmt.Sprintf(format, args...)}
 }
 
-// Reservation lifecycle states.
+// Reservation lifecycle states. StatusPending is also the state of an
+// adjustment that has not been folded into the quota total yet.
 const (
 	StatusPending   = "pending"
 	StatusConfirmed = "confirmed"
 	StatusReleased  = "released"
 	StatusReversed  = "reversed"
+	StatusApplied   = "applied"
 )
 
 // Settlement actions.
@@ -88,10 +91,37 @@ type Reversal struct {
 	CreatedAt     time.Time  `json:"created_at"`
 }
 
+// Adjustment is a caller-initiated change of the quota total, identified by
+// the caller-supplied adjustment identifier, unique within the entitlement.
+// Delta is a non-zero integer: positive grows the quota total, negative
+// shrinks it. The adjustment is folded into the quota total once its
+// effective time has arrived — an increase always applies, a decrease only
+// when the adjusted total still covers used plus unsettled quota. Status is
+// "pending" until applied, then "applied".
+type Adjustment struct {
+	AdjustmentID string     `json:"adjustment_id"`
+	Delta        int64      `json:"delta"`
+	EffectiveAt  time.Time  `json:"effective_at"`
+	Status       string     `json:"status"`
+	AppliedAt    *time.Time `json:"applied_at,omitempty"`
+	CreatedAt    time.Time  `json:"created_at"`
+}
+
+// adjustmentStatus derives the lifecycle state from the application
+// timestamp.
+func adjustmentStatus(appliedAt *time.Time) string {
+	if appliedAt != nil {
+		return StatusApplied
+	}
+	return StatusPending
+}
+
 // View is the per-entitlement quota and reservation report. Reservations
 // lists both reservations and corrective reversals; a reversal entry carries
 // its own correction identifier in ReservationID and status "reversed".
-// UsedAmount is confirmed quota minus effective reversals.
+// UsedAmount is confirmed quota minus effective reversals. Adjustments lists
+// every quota adjustment with its effective time and whether it has been
+// folded into QuotaTotal; the quota figures only reflect applied adjustments.
 type View struct {
 	EntitlementID   string        `json:"entitlement_id"`
 	SeatsTotal      int64         `json:"seats_total"`
@@ -103,6 +133,7 @@ type View struct {
 	ValidFrom       time.Time     `json:"valid_from"`
 	ValidTo         time.Time     `json:"valid_to"`
 	Reservations    []Reservation `json:"reservations"`
+	Adjustments     []Adjustment  `json:"adjustments"`
 }
 
 var identifierPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
@@ -157,7 +188,16 @@ CREATE TABLE IF NOT EXISTS reversals (
 );
 -- Databases initialized by an older schema may already have a reversals
 -- table without the settlement timestamp.
-ALTER TABLE reversals ADD COLUMN IF NOT EXISTS settled_at TIMESTAMPTZ;`)
+ALTER TABLE reversals ADD COLUMN IF NOT EXISTS settled_at TIMESTAMPTZ;
+CREATE TABLE IF NOT EXISTS adjustments (
+    entitlement_id TEXT NOT NULL REFERENCES entitlements (entitlement_id),
+    adjustment_id  TEXT NOT NULL,
+    delta          BIGINT NOT NULL CHECK (delta <> 0),
+    effective_at   TIMESTAMPTZ NOT NULL,
+    applied_at     TIMESTAMPTZ,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (entitlement_id, adjustment_id)
+);`)
 	if err != nil {
 		return fmt.Errorf("migrate schema: %w", err)
 	}
@@ -218,6 +258,7 @@ VALUES ($1, $2, $3, $4, $5)`,
 
 // entitlementRow is the locked state shared by the mutating flows.
 type entitlementRow struct {
+	seatsTotal int64
 	quotaTotal int64
 	usedAmount int64
 	validFrom  time.Time
@@ -229,9 +270,9 @@ type entitlementRow struct {
 func lockEntitlement(ctx context.Context, tx pgx.Tx, entitlementID string) (entitlementRow, error) {
 	var row entitlementRow
 	err := tx.QueryRow(ctx, `
-SELECT quota_total, used_amount, valid_from, valid_to, now()
+SELECT seats_total, quota_total, used_amount, valid_from, valid_to, now()
 FROM entitlements WHERE entitlement_id = $1 FOR UPDATE`, entitlementID).
-		Scan(&row.quotaTotal, &row.usedAmount, &row.validFrom, &row.validTo, &row.now)
+		Scan(&row.seatsTotal, &row.quotaTotal, &row.usedAmount, &row.validFrom, &row.validTo, &row.now)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return entitlementRow{}, fail(CodeEntitlementNotFound, "entitlement %q does not exist", entitlementID)
 	}
@@ -250,6 +291,72 @@ WHERE entitlement_id = $1 AND status = 'pending'`, entitlementID).Scan(&pending)
 		return 0, fmt.Errorf("sum pending reservations: %w", err)
 	}
 	return pending, nil
+}
+
+// applyDueAdjustments folds every adjustment whose effective time has arrived
+// into the entitlement's quota total, each exactly once. Increases always
+// apply. A decrease applies only when the adjusted total stays positive and
+// still covers used plus unsettled quota; otherwise it stays pending and is
+// retried by the next operation on the entitlement. It runs under the
+// per-entitlement row lock, so concurrent operations, repeated requests and
+// restarts can never apply an adjustment twice, and ent.quotaTotal is left
+// holding the current total.
+func applyDueAdjustments(ctx context.Context, tx pgx.Tx, ent *entitlementRow, entitlementID string) error {
+	rows, err := tx.Query(ctx, `
+SELECT adjustment_id, delta FROM adjustments
+WHERE entitlement_id = $1 AND applied_at IS NULL AND effective_at <= $2
+ORDER BY effective_at, created_at, adjustment_id`, entitlementID, ent.now)
+	if err != nil {
+		return fmt.Errorf("list due adjustments: %w", err)
+	}
+	type dueAdjustment struct {
+		id    string
+		delta int64
+	}
+	var due []dueAdjustment
+	for rows.Next() {
+		var d dueAdjustment
+		if err := rows.Scan(&d.id, &d.delta); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan due adjustment: %w", err)
+		}
+		due = append(due, d)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("list due adjustments: %w", err)
+	}
+	rows.Close()
+	if len(due) == 0 {
+		return nil
+	}
+	// Occupancy does not change while adjustments are folded in, so one
+	// pending sum serves every feasibility check below.
+	pending, err := pendingAmount(ctx, tx, entitlementID)
+	if err != nil {
+		return err
+	}
+	for _, d := range due {
+		newTotal := ent.quotaTotal + d.delta
+		if d.delta < 0 && (newTotal <= 0 || ent.usedAmount+pending > newTotal) {
+			// The decrease would crowd out occupied quota (or drop the
+			// total to zero or below): leave it pending.
+			continue
+		}
+		if _, err := tx.Exec(ctx, `
+UPDATE adjustments SET applied_at = now()
+WHERE entitlement_id = $1 AND adjustment_id = $2 AND applied_at IS NULL`,
+			entitlementID, d.id); err != nil {
+			return fmt.Errorf("mark adjustment applied: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+UPDATE entitlements SET quota_total = quota_total + $1 WHERE entitlement_id = $2`,
+			d.delta, entitlementID); err != nil {
+			return fmt.Errorf("adjust quota total: %w", err)
+		}
+		ent.quotaTotal = newTotal
+	}
+	return nil
 }
 
 // CreateReservation places a quota hold. The caller-supplied reservationID is
@@ -271,6 +378,9 @@ func (s *Store) CreateReservation(ctx context.Context, entitlementID, reservatio
 
 	ent, err := lockEntitlement(ctx, tx, entitlementID)
 	if err != nil {
+		return Reservation{}, false, err
+	}
+	if err := applyDueAdjustments(ctx, tx, &ent, entitlementID); err != nil {
 		return Reservation{}, false, err
 	}
 
@@ -332,7 +442,11 @@ func (s *Store) SettleReservation(ctx context.Context, entitlementID, reservatio
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	if _, err := lockEntitlement(ctx, tx, entitlementID); err != nil {
+	ent, err := lockEntitlement(ctx, tx, entitlementID)
+	if err != nil {
+		return Reservation{}, err
+	}
+	if err := applyDueAdjustments(ctx, tx, &ent, entitlementID); err != nil {
 		return Reservation{}, err
 	}
 	var reservation Reservation
@@ -361,6 +475,7 @@ UPDATE entitlements SET used_amount = used_amount + $1 WHERE entitlement_id = $2
 			reservation.Amount, entitlementID); err != nil {
 			return Reservation{}, fmt.Errorf("consume quota: %w", err)
 		}
+		ent.usedAmount += reservation.Amount
 	}
 	err = tx.QueryRow(ctx, `
 UPDATE reservations SET status = $1, settled_at = now()
@@ -370,6 +485,11 @@ RETURNING reservation_id, amount, status, settled_at, created_at`,
 		Scan(&reservation.ReservationID, &reservation.Amount, &reservation.Status, &reservation.SettledAt, &reservation.CreatedAt)
 	if err != nil {
 		return Reservation{}, fmt.Errorf("settle reservation: %w", err)
+	}
+	// A release frees occupied quota, which may let a blocked decrease take
+	// effect right away.
+	if err := applyDueAdjustments(ctx, tx, &ent, entitlementID); err != nil {
+		return Reservation{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return Reservation{}, fmt.Errorf("commit settlement: %w", err)
@@ -397,7 +517,11 @@ func (s *Store) ReverseReservation(ctx context.Context, entitlementID, reservati
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	if _, err := lockEntitlement(ctx, tx, entitlementID); err != nil {
+	ent, err := lockEntitlement(ctx, tx, entitlementID)
+	if err != nil {
+		return Reversal{}, false, err
+	}
+	if err := applyDueAdjustments(ctx, tx, &ent, entitlementID); err != nil {
 		return Reversal{}, false, err
 	}
 
@@ -468,38 +592,142 @@ UPDATE entitlements SET used_amount = used_amount - $1 WHERE entitlement_id = $2
 		created.Amount, entitlementID); err != nil {
 		return Reversal{}, false, fmt.Errorf("refund quota: %w", err)
 	}
+	// The refund lowers used quota, which may let a blocked decrease take
+	// effect right away.
+	ent.usedAmount -= created.Amount
+	if err := applyDueAdjustments(ctx, tx, &ent, entitlementID); err != nil {
+		return Reversal{}, false, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return Reversal{}, false, fmt.Errorf("commit reversal: %w", err)
 	}
 	return created, true, nil
 }
 
-// GetView returns the quota breakdown and reservation list for an
-// entitlement, consistent with the committed state.
+// CreateAdjustment registers a quota adjustment against an entitlement. The
+// caller-supplied adjustmentID is unique per entitlement: resubmitting it
+// with the same delta and effective time returns the original adjustment
+// without touching quota again (created=false); resubmitting it with a
+// different delta or effective time fails without changing state. The
+// adjustment is recorded as pending and folds into the quota total once its
+// effective time has arrived — immediately when the effective time is not in
+// the future. An increase always applies; a decrease applies only while the
+// adjusted total still covers used plus unsettled quota, otherwise it stays
+// pending and takes effect automatically once occupancy allows. A decrease
+// that would drop the current quota total to zero or below fails and writes
+// nothing.
+func (s *Store) CreateAdjustment(ctx context.Context, entitlementID, adjustmentID string, delta int64, effectiveAt time.Time) (Adjustment, bool, error) {
+	if err := validIdentifier("adjustment_id", adjustmentID); err != nil {
+		return Adjustment{}, false, err
+	}
+	if delta == 0 {
+		return Adjustment{}, false, fail(CodeInvalidRequest, "delta is required and must be a non-zero integer")
+	}
+	if effectiveAt.IsZero() {
+		return Adjustment{}, false, fail(CodeInvalidRequest, "effective_at is required (an RFC 3339 timestamp)")
+	}
+	effectiveAt = effectiveAt.UTC()
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Adjustment{}, false, fmt.Errorf("begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	ent, err := lockEntitlement(ctx, tx, entitlementID)
+	if err != nil {
+		return Adjustment{}, false, err
+	}
+	// Fold in adjustments that came due earlier so a new decrease is checked
+	// against the current quota total.
+	if err := applyDueAdjustments(ctx, tx, &ent, entitlementID); err != nil {
+		return Adjustment{}, false, err
+	}
+
+	var existing Adjustment
+	err = tx.QueryRow(ctx, `
+SELECT adjustment_id, delta, effective_at, applied_at, created_at
+FROM adjustments WHERE entitlement_id = $1 AND adjustment_id = $2`,
+		entitlementID, adjustmentID).
+		Scan(&existing.AdjustmentID, &existing.Delta, &existing.EffectiveAt, &existing.AppliedAt, &existing.CreatedAt)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return Adjustment{}, false, fmt.Errorf("load adjustment: %w", err)
+	}
+	if err == nil {
+		if existing.Delta != delta || !existing.EffectiveAt.Equal(effectiveAt) {
+			return Adjustment{}, false, fail(CodeAdjustmentParamChanged,
+				"adjustment %q already exists with delta %d and effective_at %s, not delta %d and effective_at %s",
+				adjustmentID, existing.Delta, existing.EffectiveAt.Format(time.RFC3339),
+				delta, effectiveAt.Format(time.RFC3339))
+		}
+		existing.Status = adjustmentStatus(existing.AppliedAt)
+		return existing, false, tx.Commit(ctx)
+	}
+
+	if delta < 0 && ent.quotaTotal+delta <= 0 {
+		return Adjustment{}, false, fail(CodeInsufficientQuota,
+			"decrease of %d would drop the quota total of %d to zero or below", -delta, ent.quotaTotal)
+	}
+	var created Adjustment
+	err = tx.QueryRow(ctx, `
+INSERT INTO adjustments (entitlement_id, adjustment_id, delta, effective_at)
+VALUES ($1, $2, $3, $4)
+RETURNING adjustment_id, delta, effective_at, applied_at, created_at`,
+		entitlementID, adjustmentID, delta, effectiveAt).
+		Scan(&created.AdjustmentID, &created.Delta, &created.EffectiveAt, &created.AppliedAt, &created.CreatedAt)
+	if err != nil {
+		return Adjustment{}, false, fmt.Errorf("insert adjustment: %w", err)
+	}
+	// An effective time that has already arrived applies within the same
+	// transaction (a decrease only when occupancy allows it).
+	if err := applyDueAdjustments(ctx, tx, &ent, entitlementID); err != nil {
+		return Adjustment{}, false, err
+	}
+	if created.AppliedAt == nil && !effectiveAt.After(ent.now) {
+		if err := tx.QueryRow(ctx, `
+SELECT applied_at FROM adjustments WHERE entitlement_id = $1 AND adjustment_id = $2`,
+			entitlementID, adjustmentID).Scan(&created.AppliedAt); err != nil {
+			return Adjustment{}, false, fmt.Errorf("reload adjustment: %w", err)
+		}
+	}
+	created.Status = adjustmentStatus(created.AppliedAt)
+	if err := tx.Commit(ctx); err != nil {
+		return Adjustment{}, false, fmt.Errorf("commit adjustment: %w", err)
+	}
+	return created, true, nil
+}
+
+// GetView returns the quota breakdown, reservation list and adjustment list
+// for an entitlement, consistent with the committed state. Due adjustments
+// are folded into the quota total as part of the read, under the same row
+// lock as the mutating flows, so the reported figures always reflect every
+// adjustment whose effective time has arrived — applied exactly once, even
+// across restarts.
 func (s *Store) GetView(ctx context.Context, entitlementID string) (View, error) {
-	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return View{}, fmt.Errorf("begin transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	var view View
-	var now time.Time
-	err = tx.QueryRow(ctx, `
-SELECT seats_total, quota_total, used_amount, valid_from, valid_to, now()
-FROM entitlements WHERE entitlement_id = $1`, entitlementID).
-		Scan(&view.SeatsTotal, &view.QuotaTotal, &view.UsedAmount, &view.ValidFrom, &view.ValidTo, &now)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return View{}, fail(CodeEntitlementNotFound, "entitlement %q does not exist", entitlementID)
-	}
+	ent, err := lockEntitlement(ctx, tx, entitlementID)
 	if err != nil {
-		return View{}, fmt.Errorf("load entitlement: %w", err)
+		return View{}, err
 	}
+	if err := applyDueAdjustments(ctx, tx, &ent, entitlementID); err != nil {
+		return View{}, err
+	}
+
+	var view View
 	view.EntitlementID = entitlementID
+	view.SeatsTotal = ent.seatsTotal
+	view.QuotaTotal = ent.quotaTotal
+	view.UsedAmount = ent.usedAmount
+	view.ValidFrom = ent.validFrom
+	view.ValidTo = ent.validTo
 	switch {
-	case now.Before(view.ValidFrom):
+	case ent.now.Before(view.ValidFrom):
 		view.Status = "pending"
-	case now.Before(view.ValidTo):
+	case ent.now.Before(view.ValidTo):
 		view.Status = "active"
 	default:
 		view.Status = "expired"
@@ -534,6 +762,28 @@ ORDER BY created_at, reservation_id`, entitlementID)
 	}
 	if err := rows.Err(); err != nil {
 		return View{}, fmt.Errorf("list reservations: %w", err)
+	}
+	rows.Close()
+
+	adjustmentRows, err := tx.Query(ctx, `
+SELECT adjustment_id, delta, effective_at, applied_at, created_at
+FROM adjustments WHERE entitlement_id = $1
+ORDER BY created_at, adjustment_id`, entitlementID)
+	if err != nil {
+		return View{}, fmt.Errorf("list adjustments: %w", err)
+	}
+	defer adjustmentRows.Close()
+	view.Adjustments = []Adjustment{}
+	for adjustmentRows.Next() {
+		var a Adjustment
+		if err := adjustmentRows.Scan(&a.AdjustmentID, &a.Delta, &a.EffectiveAt, &a.AppliedAt, &a.CreatedAt); err != nil {
+			return View{}, fmt.Errorf("scan adjustment: %w", err)
+		}
+		a.Status = adjustmentStatus(a.AppliedAt)
+		view.Adjustments = append(view.Adjustments, a)
+	}
+	if err := adjustmentRows.Err(); err != nil {
+		return View{}, fmt.Errorf("list adjustments: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return View{}, fmt.Errorf("commit view: %w", err)

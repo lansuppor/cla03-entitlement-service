@@ -16,6 +16,7 @@ type Service interface {
 	CreateReservation(ctx context.Context, entitlementID, reservationID string, amount int64) (entitlements.Reservation, bool, error)
 	SettleReservation(ctx context.Context, entitlementID, reservationID, action string) (entitlements.Reservation, error)
 	ReverseReservation(ctx context.Context, entitlementID, reservationID, reversalID string) (entitlements.Reversal, bool, error)
+	CreateAdjustment(ctx context.Context, entitlementID, adjustmentID string, delta int64, effectiveAt time.Time) (entitlements.Adjustment, bool, error)
 	GetView(ctx context.Context, entitlementID string) (entitlements.View, error)
 }
 
@@ -41,6 +42,7 @@ func New(checkDatabase func(context.Context) error, service Service) http.Handle
 	mux.HandleFunc("POST /entitlements/{entitlementID}/reservations/{reservationID}/confirm", h.settle(entitlements.ActionConfirm))
 	mux.HandleFunc("POST /entitlements/{entitlementID}/reservations/{reservationID}/release", h.settle(entitlements.ActionRelease))
 	mux.HandleFunc("POST /entitlements/{entitlementID}/reservations/{reservationID}/reverse", h.reverseReservation)
+	mux.HandleFunc("POST /entitlements/{entitlementID}/adjustments", h.createAdjustment)
 	return mux
 }
 
@@ -148,6 +150,45 @@ func (h *handlers) reverseReservation(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, status, reversal)
 }
 
+type createAdjustmentRequest struct {
+	AdjustmentID string `json:"adjustment_id"`
+	Delta        *int64 `json:"delta"`
+	EffectiveAt  string `json:"effective_at"`
+}
+
+func (h *handlers) createAdjustment(w http.ResponseWriter, r *http.Request) {
+	var req createAdjustmentRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	if req.Delta == nil || *req.Delta == 0 {
+		respondError(w, &entitlements.Error{
+			Code:    entitlements.CodeInvalidRequest,
+			Message: "delta is required and must be a non-zero integer",
+		})
+		return
+	}
+	effectiveAt, err := time.Parse(time.RFC3339, req.EffectiveAt)
+	if req.EffectiveAt == "" || err != nil {
+		respondError(w, &entitlements.Error{
+			Code:    entitlements.CodeInvalidRequest,
+			Message: "effective_at must be an RFC 3339 timestamp, e.g. 2026-06-01T00:00:00Z",
+		})
+		return
+	}
+	adjustment, created, err := h.service.CreateAdjustment(
+		r.Context(), r.PathValue("entitlementID"), req.AdjustmentID, *req.Delta, effectiveAt)
+	if err != nil {
+		respondError(w, err)
+		return
+	}
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	respondJSON(w, status, adjustment)
+}
+
 func (h *handlers) getEntitlement(w http.ResponseWriter, r *http.Request) {
 	view, err := h.service.GetView(r.Context(), r.PathValue("entitlementID"))
 	if err != nil {
@@ -184,6 +225,7 @@ var errorStatus = map[string]int{
 	entitlements.CodeReservationSettled:      http.StatusConflict,
 	entitlements.CodeReservationNotConfirmed: http.StatusUnprocessableEntity,
 	entitlements.CodeReservationReversed:     http.StatusConflict,
+	entitlements.CodeAdjustmentParamChanged:  http.StatusConflict,
 }
 
 func respondError(w http.ResponseWriter, err error) {

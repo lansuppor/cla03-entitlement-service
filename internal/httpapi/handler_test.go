@@ -50,11 +50,14 @@ type fakeService struct {
 	entitlement  entitlements.Entitlement
 	reservation  entitlements.Reservation
 	reversal     entitlements.Reversal
+	adjustment   entitlements.Adjustment
 	created      bool
 	view         entitlements.View
 	err          error
 	settleAction string
 	reversalID   string
+	adjustmentID string
+	delta        int64
 }
 
 func (f *fakeService) CreateEntitlement(_ context.Context, _ entitlements.CreateEntitlementInput) (entitlements.Entitlement, error) {
@@ -73,6 +76,12 @@ func (f *fakeService) SettleReservation(_ context.Context, _, _, action string) 
 func (f *fakeService) ReverseReservation(_ context.Context, _, _, reversalID string) (entitlements.Reversal, bool, error) {
 	f.reversalID = reversalID
 	return f.reversal, f.created, f.err
+}
+
+func (f *fakeService) CreateAdjustment(_ context.Context, _, adjustmentID string, delta int64, _ time.Time) (entitlements.Adjustment, bool, error) {
+	f.adjustmentID = adjustmentID
+	f.delta = delta
+	return f.adjustment, f.created, f.err
 }
 
 func (f *fakeService) GetView(_ context.Context, _ string) (entitlements.View, error) {
@@ -124,6 +133,7 @@ func TestErrorMapping(t *testing.T) {
 		{"already settled", entitlements.CodeReservationSettled, 409},
 		{"not confirmed", entitlements.CodeReservationNotConfirmed, 422},
 		{"already reversed", entitlements.CodeReservationReversed, 409},
+		{"adjustment param mismatch", entitlements.CodeAdjustmentParamChanged, 409},
 		{"internal", "unmapped", 500},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -196,6 +206,51 @@ func TestSettleRoutes(t *testing.T) {
 	response = serve(t, service, "POST", "/entitlements/ent-1/reservations/r1/release", "")
 	if response.Code != 200 || service.settleAction != entitlements.ActionRelease {
 		t.Fatalf("release: status=%d action=%q", response.Code, service.settleAction)
+	}
+}
+
+func TestAdjustmentRoute(t *testing.T) {
+	adjustment := entitlements.Adjustment{
+		AdjustmentID: "adj-1", Delta: 20, Status: "pending",
+		EffectiveAt: time.Now().Add(time.Hour), CreatedAt: time.Now(),
+	}
+	service := &fakeService{adjustment: adjustment, created: true}
+	created := serve(t, service, "POST", "/entitlements/ent-1/adjustments",
+		`{"adjustment_id":"adj-1","delta":20,"effective_at":"2026-06-01T00:00:00Z"}`)
+	if created.Code != 201 || service.adjustmentID != "adj-1" || service.delta != 20 {
+		t.Fatalf("new adjustment: status=%d adjustment_id=%q delta=%d body=%q",
+			created.Code, service.adjustmentID, service.delta, created.Body.String())
+	}
+	if !strings.Contains(created.Body.String(), `"adjustment_id":"adj-1"`) {
+		t.Fatalf("adjustment body: %q", created.Body.String())
+	}
+	service.created = false
+	replayed := serve(t, service, "POST", "/entitlements/ent-1/adjustments",
+		`{"adjustment_id":"adj-1","delta":20,"effective_at":"2026-06-01T00:00:00Z"}`)
+	if replayed.Code != 200 {
+		t.Fatalf("replayed adjustment: status=%d body=%q", replayed.Code, replayed.Body.String())
+	}
+	// A missing or zero delta, a bad timestamp, unknown fields and malformed
+	// JSON are rejected before the domain is called.
+	for _, body := range []string{
+		`{"adjustment_id":"adj-1","effective_at":"2026-06-01T00:00:00Z"}`,
+		`{"adjustment_id":"adj-1","delta":0,"effective_at":"2026-06-01T00:00:00Z"}`,
+		`{"adjustment_id":"adj-1","delta":20}`,
+		`{"adjustment_id":"adj-1","delta":20,"effective_at":"soon"}`,
+		`{"adjustment_id":"adj-1","delta":20,"effective_at":"2026-06-01T00:00:00Z","amount":5}`,
+		`{`,
+	} {
+		response := serve(t, service, "POST", "/entitlements/ent-1/adjustments", body)
+		if response.Code != 400 || !strings.Contains(response.Body.String(), `"invalid_request"`) {
+			t.Fatalf("body %q: status=%d body=%q", body, response.Code, response.Body.String())
+		}
+	}
+	// A missing adjustment_id reaches the domain, which rejects it.
+	invalid := &fakeService{err: &entitlements.Error{Code: entitlements.CodeInvalidRequest, Message: "bad adjustment_id"}}
+	response := serve(t, invalid, "POST", "/entitlements/ent-1/adjustments",
+		`{"delta":20,"effective_at":"2026-06-01T00:00:00Z"}`)
+	if response.Code != 400 || !strings.Contains(response.Body.String(), `"invalid_request"`) {
+		t.Fatalf("missing adjustment_id: status=%d body=%q", response.Code, response.Body.String())
 	}
 }
 
