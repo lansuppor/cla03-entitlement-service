@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/lansolocoder/cla03-entitlement-service/internal/entitlements"
 	"github.com/lansolocoder/cla03-entitlement-service/internal/httpapi"
 )
 
@@ -26,12 +27,16 @@ func main() {
 		log.Fatal("invalid database configuration")
 	}
 	defer pool.Close()
+	store := entitlements.NewStore(pool)
+	if err := store.Migrate(ctx); err != nil {
+		log.Fatal("schema migration failed: ", err)
+	}
 	address := os.Getenv("LISTEN_ADDR")
 	if address == "" {
 		address = "127.0.0.1:8080"
 	}
 	server := &http.Server{
-		Addr: address, Handler: httpapi.New(pool.Ping),
+		Addr: address, Handler: httpapi.New(pool.Ping, store),
 		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second,
 		WriteTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second,
 	}
