@@ -17,6 +17,7 @@ type Service interface {
 	SettleReservation(ctx context.Context, entitlementID, reservationID, action string) (entitlements.Reservation, error)
 	ReverseReservation(ctx context.Context, entitlementID, reservationID, reversalID string) (entitlements.Reversal, bool, error)
 	CreateAdjustment(ctx context.Context, entitlementID, adjustmentID string, delta int64, effectiveAt time.Time) (entitlements.Adjustment, bool, error)
+	RescheduleEntitlement(ctx context.Context, entitlementID, rescheduleID string, validFrom, validTo time.Time) (entitlements.Reschedule, bool, error)
 	GetView(ctx context.Context, entitlementID string) (entitlements.View, error)
 }
 
@@ -43,6 +44,7 @@ func New(checkDatabase func(context.Context) error, service Service) http.Handle
 	mux.HandleFunc("POST /entitlements/{entitlementID}/reservations/{reservationID}/release", h.settle(entitlements.ActionRelease))
 	mux.HandleFunc("POST /entitlements/{entitlementID}/reservations/{reservationID}/reverse", h.reverseReservation)
 	mux.HandleFunc("POST /entitlements/{entitlementID}/adjustments", h.createAdjustment)
+	mux.HandleFunc("POST /entitlements/{entitlementID}/reschedules", h.rescheduleEntitlement)
 	return mux
 }
 
@@ -189,6 +191,39 @@ func (h *handlers) createAdjustment(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, status, adjustment)
 }
 
+type rescheduleRequest struct {
+	RescheduleID string `json:"reschedule_id"`
+	ValidFrom    string `json:"valid_from"`
+	ValidTo      string `json:"valid_to"`
+}
+
+func (h *handlers) rescheduleEntitlement(w http.ResponseWriter, r *http.Request) {
+	var req rescheduleRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	validFrom, errFrom := time.Parse(time.RFC3339, req.ValidFrom)
+	validTo, errTo := time.Parse(time.RFC3339, req.ValidTo)
+	if req.ValidFrom == "" || req.ValidTo == "" || errFrom != nil || errTo != nil {
+		respondError(w, &entitlements.Error{
+			Code:    entitlements.CodeInvalidRequest,
+			Message: "valid_from and valid_to must be RFC 3339 timestamps, e.g. 2026-01-01T00:00:00Z",
+		})
+		return
+	}
+	reschedule, created, err := h.service.RescheduleEntitlement(
+		r.Context(), r.PathValue("entitlementID"), req.RescheduleID, validFrom, validTo)
+	if err != nil {
+		respondError(w, err)
+		return
+	}
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	respondJSON(w, status, reschedule)
+}
+
 func (h *handlers) getEntitlement(w http.ResponseWriter, r *http.Request) {
 	view, err := h.service.GetView(r.Context(), r.PathValue("entitlementID"))
 	if err != nil {
@@ -226,6 +261,7 @@ var errorStatus = map[string]int{
 	entitlements.CodeReservationNotConfirmed: http.StatusUnprocessableEntity,
 	entitlements.CodeReservationReversed:     http.StatusConflict,
 	entitlements.CodeAdjustmentParamChanged:  http.StatusConflict,
+	entitlements.CodeRescheduleParamChanged:  http.StatusConflict,
 }
 
 func respondError(w http.ResponseWriter, err error) {

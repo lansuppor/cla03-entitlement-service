@@ -1,6 +1,6 @@
 # Entitlement service
 
-Go HTTP service for team service entitlements: seat-quota grants with idempotent reservations, confirm/release settlement, corrective reversals of confirmed reservations, and scheduled quota-total adjustments, persisted in PostgreSQL. Requires Go 1.27.1 and PostgreSQL 18.6.
+Go HTTP service for team service entitlements: seat-quota grants with idempotent reservations, confirm/release settlement, corrective reversals of confirmed reservations, scheduled quota-total adjustments, and rescheduling of the validity window, persisted in PostgreSQL. Requires Go 1.27.1 and PostgreSQL 18.6.
 
 ```sh
 go mod download
@@ -78,9 +78,23 @@ When a customer buys more seats, is granted bonus quota, or has quota clawed bac
 
 Before `effective_at` the adjustment is recorded with status `pending`, is listed in the entitlement view, and does not change the quota total. Once the effective time has arrived the adjustment is folded into `quota_total` exactly once — by the next operation or query on the entitlement — and reported with status `applied` and its `applied_at` timestamp; service restarts and late duplicate requests can neither apply it twice nor lose it. An increase always applies. A decrease applies only while the adjusted total still covers used plus unsettled quota: if occupied quota exceeds the adjusted total, the decrease stays `pending` (visible as such in the view) and takes effect automatically, in full and exactly once, once occupancy allows — it is never partially applied, and used plus unsettled quota never exceeds the current total. A decrease that would drop the current quota total to zero or below fails with 422 `insufficient_quota` and writes nothing.
 
+### Reschedule the validity window
+
+`POST /entitlements/{entitlement_id}/reschedules`
+
+```json
+{"reschedule_id":"delay-go-live-2026-0007","valid_from":"2026-02-01T00:00:00Z","valid_to":"2027-02-01T00:00:00Z"}
+```
+
+When a customer goes live later than planned, leaves early, or the commercial deal is rescheduled, operations rewrites the validity window of an existing entitlement without touching any quota figure. `reschedule_id` is the caller-supplied business identifier, unique within the entitlement; both timestamps must be legal RFC 3339 timestamps and `valid_from` must be strictly before `valid_to`.
+
+The first submission returns 201 with the reschedule record and immediately sets the entitlement's `valid_from` and `valid_to` to the new window. Resubmitting the same identifier with the same new start and end returns 200 with the original record and does not rewrite the window again; resubmitting it with a different new start or end fails with 409 `reschedule_param_mismatch` and changes nothing. Rescheduling an unknown entitlement fails with 404 `entitlement_not_found`; missing or malformed timestamps or an inverted window fail with 400 `invalid_request`.
+
+A reschedule never changes quota totals, used quota, unsettled reservations, available quota, or any reservation, reversal or adjustment record. The entitlement's active state is judged against the new window immediately: a previously pending entitlement moved into the current window accepts new reservations right away, while one moved to a window that has already ended rejects new reservations. Pending reservations can still be confirmed or released and confirmed reservations can still be reversed after an early expiry, exactly as for ordinary expiry. Adjustments keep their own registration, pending/applied state, application counts and effective times, and still count toward the quota total on their own schedule; a reschedule only folds due adjustments into the quota total under the same lock as every other operation.
+
 ### Query an entitlement
 
-`GET /entitlements/{entitlement_id}` returns 200 with the quota breakdown, reservation list and adjustment list:
+`GET /entitlements/{entitlement_id}` returns 200 with the quota breakdown, reservation list, adjustment list and reschedule list:
 
 ```json
 {
@@ -91,19 +105,22 @@ Before `effective_at` the adjustment is recorded with status `pending`, is liste
   "reserved_amount": 0,
   "available_amount": 150,
   "status": "active",
-  "valid_from": "2026-01-01T00:00:00Z",
-  "valid_to": "2027-01-01T00:00:00Z",
+  "valid_from": "2026-02-01T00:00:00Z",
+  "valid_to": "2027-02-01T00:00:00Z",
   "reservations": [
     {"reservation_id": "sub-a-001", "amount": 30, "status": "confirmed", "settled_at": "...", "created_at": "..."},
     {"reservation_id": "corr-2026-0001", "amount": 30, "status": "reversed", "settled_at": "...", "created_at": "..."}
   ],
   "adjustments": [
     {"adjustment_id": "upsell-2026-0042", "delta": 50, "effective_at": "2026-06-01T00:00:00Z", "status": "applied", "applied_at": "...", "created_at": "..."}
+  ],
+  "reschedules": [
+    {"reschedule_id": "delay-go-live-2026-0007", "valid_from": "2026-02-01T00:00:00Z", "valid_to": "2027-02-01T00:00:00Z", "created_at": "..."}
   ]
 }
 ```
 
-`status` is `pending`, `active` or `expired` relative to the validity window. Each reservation entry reports its business identifier, amount, lifecycle status (`pending`, `confirmed`, `released` for reservations; `reversed` for corrective reversals) and settlement timestamp. `used_amount` is confirmed quota minus effective reversals, so a reversed reservation leaves the original confirmation and the reversal both visible while the quota figures reflect only the net effect. Each adjustment entry reports its business identifier, delta, effective time and whether it is `pending` or `applied`; `quota_total`, `available_amount` and the other figures count only applied adjustments, so they always match the quota actually in force.
+`status` is `pending`, `active` or `expired` relative to the validity window. Each reservation entry reports its business identifier, amount, lifecycle status (`pending`, `confirmed`, `released` for reservations; `reversed` for corrective reversals) and settlement timestamp. `used_amount` is confirmed quota minus effective reversals, so a reversed reservation leaves the original confirmation and the reversal both visible while the quota figures reflect only the net effect. Each adjustment entry reports its business identifier, delta, effective time and whether it is `pending` or `applied`; `quota_total`, `available_amount` and the other figures count only applied adjustments, so they always match the quota actually in force. Each reschedule entry reports its business identifier, the new start and end of the validity window and its creation time, in creation order; `valid_from`, `valid_to` and `status` always reflect the latest reschedule that has taken effect.
 
 ### Error codes
 
@@ -120,10 +137,11 @@ Before `effective_at` the adjustment is recorded with status `pending`, is liste
 | `reservation_not_confirmed` | 422 | Reservation is not confirmed, so it cannot be reversed |
 | `reservation_already_reversed` | 409 | Reservation was already reversed |
 | `adjustment_param_mismatch` | 409 | Adjustment identifier reused with a different delta or effective time |
+| `reschedule_param_mismatch` | 409 | Reschedule identifier reused with a different new start or end |
 
 ## Consistency
 
-Concurrent reservations, confirmations, releases, reversals and adjustments on the same entitlement are serialized with a row lock in PostgreSQL, so used quota plus unsettled reservations never exceeds the total quota, repeated requests never grant, refund or adjust quota twice, and failed requests leave no partial results. Due adjustments are folded into the quota total inside the same lock — by whichever operation or query touches the entitlement first after the effective time — so every adjustment applies exactly once and a decrease never crowds out occupied quota. All state lives in PostgreSQL, so a restart preserves every quota figure, reservation status, reversal record and adjustment record including its applied or pending state.
+Concurrent reservations, confirmations, releases, reversals, adjustments and reschedules on the same entitlement are serialized with a row lock in PostgreSQL, so used quota plus unsettled reservations never exceeds the total quota, repeated requests never grant, refund, adjust quota or rewrite the validity window twice, and failed requests leave no partial results. Due adjustments are folded into the quota total inside the same lock — by whichever operation or query touches the entitlement first after the effective time — so every adjustment applies exactly once and a decrease never crowds out occupied quota. A reschedule only rewrites the validity window within that lock, never a quota figure, and does not change any adjustment's registration, pending/applied state or application count. All state lives in PostgreSQL, so a restart preserves every quota figure, reservation status, reversal record, adjustment record (including its applied or pending state) and reschedule record (including the window it set).
 
 The local setup uses a trusted loopback connection and C collation without ICU. Use separate database directories, database ports and HTTP ports when running multiple copies.
 
@@ -177,3 +195,38 @@ curl -s -X POST 127.0.0.1:8080/entitlements/team-beta/adjustments -d '{"adjustme
 curl -s -X POST 127.0.0.1:8080/entitlements/team-beta/adjustments -d '{"adjustment_id":"clawback-002","delta":-50,"effective_at":"2026-01-01T00:00:00Z"}' # 422 insufficient_quota (total would reach 0)
 curl -s -X POST 127.0.0.1:8080/entitlements/team-beta/adjustments -d '{"adjustment_id":"clawback-003","delta":0,"effective_at":"2026-01-01T00:00:00Z"}'   # 400 invalid_request
 ```
+
+## Verifying the reschedule flow
+
+With the server running as above, a delayed go-live, an early take-down and idempotent replays can all be exercised with curl. The timestamps below are computed relative to "now" so the walkthrough works on any day:
+
+```sh
+# Create an entitlement whose window starts one hour in the future: new
+# reservations fail with 422 entitlement_not_active.
+curl -s -X POST 127.0.0.1:8080/entitlements -d '{"entitlement_id":"team-gamma","quota_total":100,"valid_from":"2027-01-01T00:00:00Z","valid_to":"2028-01-01T00:00:00Z"}'
+curl -s -i -X POST 127.0.0.1:8080/entitlements/team-gamma/reservations -d '{"reservation_id":"sub-g-001","amount":30}' | head -1   # HTTP/1.1 422
+
+# Reschedule the window so it started an hour ago and ends in an hour: 201,
+# and the reservation now succeeds because the entitlement is active.
+curl -s -X POST 127.0.0.1:8080/entitlements/team-gamma/reschedules \
+  -d "{\"reschedule_id\":\"go-live-2026-001\",\"valid_from\":\"$(date -u -v-1H +%Y-%m-%dT%H:%M:%SZ)\",\"valid_to\":\"$(date -u -v+1H +%Y-%m-%dT%H:%M:%SZ)\"}"
+curl -s -i -X POST 127.0.0.1:8080/entitlements/team-gamma/reservations -d '{"reservation_id":"sub-g-001","amount":30}' | head -1   # HTTP/1.1 201
+
+# Reschedule again to a window that ended two hours ago (early take-down):
+# new reservations are rejected, but the unsettled reservation still settles.
+curl -s -X POST 127.0.0.1:8080/entitlements/team-gamma/reschedules \
+  -d "{\"reschedule_id\":\"early-off-2026-001\",\"valid_from\":\"$(date -u -v-3H +%Y-%m-%dT%H:%M:%SZ)\",\"valid_to\":\"$(date -u -v-2H +%Y-%m-%dT%H:%M:%SZ)\"}"
+curl -s -i -X POST 127.0.0.1:8080/entitlements/team-gamma/reservations -d '{"reservation_id":"sub-g-002","amount":1}' | head -1     # HTTP/1.1 422
+curl -s -X POST 127.0.0.1:8080/entitlements/team-gamma/reservations/sub-g-001/confirm
+curl -s 127.0.0.1:8080/entitlements/team-gamma   # status expired, used_amount 30, quota_total unchanged at 100, reschedules lists both records
+
+# Replays and invalid reschedules are safe no-ops with stable error codes.
+curl -s -i -X POST 127.0.0.1:8080/entitlements/team-gamma/reschedules \
+  -d "{\"reschedule_id\":\"go-live-2026-001\",\"valid_from\":\"$(date -u -v-1H +%Y-%m-%dT%H:%M:%SZ)\",\"valid_to\":\"$(date -u -v+1H +%Y-%m-%dT%H:%M:%SZ)\"}" | head -1   # 200, original record
+curl -s -X POST 127.0.0.1:8080/entitlements/team-gamma/reschedules \
+  -d "{\"reschedule_id\":\"go-live-2026-001\",\"valid_from\":\"$(date -u -v-2H +%Y-%m-%dT%H:%M:%SZ)\",\"valid_to\":\"$(date -u -v+1H +%Y-%m-%dT%H:%M:%SZ)\"}"   # 409 reschedule_param_mismatch
+curl -s -X POST 127.0.0.1:8080/entitlements/team-gamma/reschedules -d '{"reschedule_id":"bad-1","valid_from":"2028-01-01T00:00:00Z","valid_to":"2027-01-01T00:00:00Z"}'   # 400 invalid_request
+curl -s -X POST 127.0.0.1:8080/entitlements/team-missing/reschedules -d '{"reschedule_id":"go-live-2026-001","valid_from":"2026-01-01T00:00:00Z","valid_to":"2027-01-01T00:00:00Z"}'   # 404 entitlement_not_found
+```
+
+(On Linux, replace `date -u -v-1H` with `date -u -d '1 hour ago'`, and likewise for the other offsets.)
