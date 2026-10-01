@@ -1,6 +1,7 @@
 // Package entitlements implements the seat-quota entitlement domain:
 // entitlement creation, idempotent reservations, confirm/release
-// settlement, and corrective reversals of confirmed reservations,
+// settlement, corrective reversals of confirmed reservations, scheduled
+// quota-total adjustments, and rescheduling of the validity window,
 // persisted in PostgreSQL.
 package entitlements
 
@@ -30,6 +31,7 @@ const (
 	CodeReservationNotConfirmed = "reservation_not_confirmed"
 	CodeReservationReversed     = "reservation_already_reversed"
 	CodeAdjustmentParamChanged  = "adjustment_param_mismatch"
+	CodeRescheduleParamChanged  = "reschedule_param_mismatch"
 )
 
 // Error is a domain failure with a stable machine-readable code.
@@ -107,6 +109,20 @@ type Adjustment struct {
 	CreatedAt    time.Time  `json:"created_at"`
 }
 
+// Reschedule is a caller-initiated rewrite of an entitlement's validity
+// window, identified by the caller-supplied reschedule identifier, unique
+// within the entitlement. The first submission records the reschedule and
+// immediately replaces the entitlement's valid_from and valid_to with the
+// new values; it never changes any quota figure. Resubmitting the same
+// identifier with the same window returns the original record without
+// touching the times again.
+type Reschedule struct {
+	RescheduleID string    `json:"reschedule_id"`
+	NewValidFrom time.Time `json:"new_valid_from"`
+	NewValidTo   time.Time `json:"new_valid_to"`
+	CreatedAt    time.Time `json:"created_at"`
+}
+
 // adjustmentStatus derives the lifecycle state from the application
 // timestamp.
 func adjustmentStatus(appliedAt *time.Time) string {
@@ -122,6 +138,8 @@ func adjustmentStatus(appliedAt *time.Time) string {
 // UsedAmount is confirmed quota minus effective reversals. Adjustments lists
 // every quota adjustment with its effective time and whether it has been
 // folded into QuotaTotal; the quota figures only reflect applied adjustments.
+// Reschedules lists every validity-window rewrite in creation order; the
+// reported ValidFrom/ValidTo and Status always reflect the latest one.
 type View struct {
 	EntitlementID   string        `json:"entitlement_id"`
 	SeatsTotal      int64         `json:"seats_total"`
@@ -134,6 +152,7 @@ type View struct {
 	ValidTo         time.Time     `json:"valid_to"`
 	Reservations    []Reservation `json:"reservations"`
 	Adjustments     []Adjustment  `json:"adjustments"`
+	Reschedules     []Reschedule  `json:"reschedules"`
 }
 
 var identifierPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
@@ -197,6 +216,15 @@ CREATE TABLE IF NOT EXISTS adjustments (
     applied_at     TIMESTAMPTZ,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (entitlement_id, adjustment_id)
+);
+CREATE TABLE IF NOT EXISTS reschedules (
+    entitlement_id TEXT NOT NULL REFERENCES entitlements (entitlement_id),
+    reschedule_id  TEXT NOT NULL,
+    new_valid_from TIMESTAMPTZ NOT NULL,
+    new_valid_to   TIMESTAMPTZ NOT NULL,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (entitlement_id, reschedule_id),
+    CHECK (new_valid_from < new_valid_to)
 );`)
 	if err != nil {
 		return fmt.Errorf("migrate schema: %w", err)
@@ -696,12 +724,87 @@ SELECT applied_at FROM adjustments WHERE entitlement_id = $1 AND adjustment_id =
 	return created, true, nil
 }
 
-// GetView returns the quota breakdown, reservation list and adjustment list
-// for an entitlement, consistent with the committed state. Due adjustments
-// are folded into the quota total as part of the read, under the same row
-// lock as the mutating flows, so the reported figures always reflect every
-// adjustment whose effective time has arrived — applied exactly once, even
-// across restarts.
+// RescheduleEntitlement rewrites an existing entitlement's validity window.
+// The caller-supplied rescheduleID is unique per entitlement: the first
+// submission records the reschedule and immediately sets valid_from and
+// valid_to to the new values (created=true); resubmitting the same
+// identifier with the same new window returns the original record and does
+// not touch the times again (created=false); resubmitting it with a
+// different new start or end fails without changing state. No quota figure
+// is ever modified: quota total, used, reserved and available amounts plus
+// every reservation, reversal and adjustment keep their existing behavior
+// and idempotency rules. The whole flow runs under the per-entitlement row
+// lock, so reschedules serialize with reservations, settlements, reversals
+// and adjustments, replays never rewrite the window twice, and failures
+// leave no partial state.
+func (s *Store) RescheduleEntitlement(ctx context.Context, entitlementID, rescheduleID string, newValidFrom, newValidTo time.Time) (Reschedule, bool, error) {
+	if err := validIdentifier("reschedule_id", rescheduleID); err != nil {
+		return Reschedule{}, false, err
+	}
+	if newValidFrom.IsZero() || newValidTo.IsZero() {
+		return Reschedule{}, false, fail(CodeInvalidRequest, "new_valid_from and new_valid_to are required (RFC 3339 timestamps)")
+	}
+	if !newValidFrom.Before(newValidTo) {
+		return Reschedule{}, false, fail(CodeInvalidRequest, "new_valid_from must be before new_valid_to")
+	}
+	newValidFrom = newValidFrom.UTC()
+	newValidTo = newValidTo.UTC()
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Reschedule{}, false, fmt.Errorf("begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := lockEntitlement(ctx, tx, entitlementID); err != nil {
+		return Reschedule{}, false, err
+	}
+
+	var existing Reschedule
+	err = tx.QueryRow(ctx, `
+SELECT reschedule_id, new_valid_from, new_valid_to, created_at
+FROM reschedules WHERE entitlement_id = $1 AND reschedule_id = $2`,
+		entitlementID, rescheduleID).
+		Scan(&existing.RescheduleID, &existing.NewValidFrom, &existing.NewValidTo, &existing.CreatedAt)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return Reschedule{}, false, fmt.Errorf("load reschedule: %w", err)
+	}
+	if err == nil {
+		if !existing.NewValidFrom.Equal(newValidFrom) || !existing.NewValidTo.Equal(newValidTo) {
+			return Reschedule{}, false, fail(CodeRescheduleParamChanged,
+				"reschedule %q already exists with new_valid_from %s and new_valid_to %s, not %s and %s",
+				rescheduleID, existing.NewValidFrom.Format(time.RFC3339), existing.NewValidTo.Format(time.RFC3339),
+				newValidFrom.Format(time.RFC3339), newValidTo.Format(time.RFC3339))
+		}
+		return existing, false, tx.Commit(ctx)
+	}
+
+	var created Reschedule
+	err = tx.QueryRow(ctx, `
+INSERT INTO reschedules (entitlement_id, reschedule_id, new_valid_from, new_valid_to)
+VALUES ($1, $2, $3, $4)
+RETURNING reschedule_id, new_valid_from, new_valid_to, created_at`,
+		entitlementID, rescheduleID, newValidFrom, newValidTo).
+		Scan(&created.RescheduleID, &created.NewValidFrom, &created.NewValidTo, &created.CreatedAt)
+	if err != nil {
+		return Reschedule{}, false, fmt.Errorf("insert reschedule: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+UPDATE entitlements SET valid_from = $1, valid_to = $2 WHERE entitlement_id = $3`,
+		newValidFrom, newValidTo, entitlementID); err != nil {
+		return Reschedule{}, false, fmt.Errorf("rewrite validity window: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Reschedule{}, false, fmt.Errorf("commit reschedule: %w", err)
+	}
+	return created, true, nil
+}
+
+// GetView returns the quota breakdown, reservation list, adjustment list
+// and reschedule list for an entitlement, consistent with the committed
+// state. Due adjustments are folded into the quota total as part of the
+// read, under the same row lock as the mutating flows, so the reported
+// figures always reflect every adjustment whose effective time has
+// arrived — applied exactly once, even across restarts.
 func (s *Store) GetView(ctx context.Context, entitlementID string) (View, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -784,6 +887,27 @@ ORDER BY created_at, adjustment_id`, entitlementID)
 	}
 	if err := adjustmentRows.Err(); err != nil {
 		return View{}, fmt.Errorf("list adjustments: %w", err)
+	}
+	adjustmentRows.Close()
+
+	rescheduleRows, err := tx.Query(ctx, `
+SELECT reschedule_id, new_valid_from, new_valid_to, created_at
+FROM reschedules WHERE entitlement_id = $1
+ORDER BY created_at, reschedule_id`, entitlementID)
+	if err != nil {
+		return View{}, fmt.Errorf("list reschedules: %w", err)
+	}
+	defer rescheduleRows.Close()
+	view.Reschedules = []Reschedule{}
+	for rescheduleRows.Next() {
+		var rc Reschedule
+		if err := rescheduleRows.Scan(&rc.RescheduleID, &rc.NewValidFrom, &rc.NewValidTo, &rc.CreatedAt); err != nil {
+			return View{}, fmt.Errorf("scan reschedule: %w", err)
+		}
+		view.Reschedules = append(view.Reschedules, rc)
+	}
+	if err := rescheduleRows.Err(); err != nil {
+		return View{}, fmt.Errorf("list reschedules: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return View{}, fmt.Errorf("commit view: %w", err)

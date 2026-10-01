@@ -17,6 +17,7 @@ type Service interface {
 	SettleReservation(ctx context.Context, entitlementID, reservationID, action string) (entitlements.Reservation, error)
 	ReverseReservation(ctx context.Context, entitlementID, reservationID, reversalID string) (entitlements.Reversal, bool, error)
 	CreateAdjustment(ctx context.Context, entitlementID, adjustmentID string, delta int64, effectiveAt time.Time) (entitlements.Adjustment, bool, error)
+	RescheduleEntitlement(ctx context.Context, entitlementID, rescheduleID string, newValidFrom, newValidTo time.Time) (entitlements.Reschedule, bool, error)
 	GetView(ctx context.Context, entitlementID string) (entitlements.View, error)
 }
 
@@ -43,6 +44,7 @@ func New(checkDatabase func(context.Context) error, service Service) http.Handle
 	mux.HandleFunc("POST /entitlements/{entitlementID}/reservations/{reservationID}/release", h.settle(entitlements.ActionRelease))
 	mux.HandleFunc("POST /entitlements/{entitlementID}/reservations/{reservationID}/reverse", h.reverseReservation)
 	mux.HandleFunc("POST /entitlements/{entitlementID}/adjustments", h.createAdjustment)
+	mux.HandleFunc("POST /entitlements/{entitlementID}/reschedules", h.createReschedule)
 	return mux
 }
 
@@ -189,6 +191,46 @@ func (h *handlers) createAdjustment(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, status, adjustment)
 }
 
+type createRescheduleRequest struct {
+	RescheduleID string `json:"reschedule_id"`
+	NewValidFrom string `json:"new_valid_from"`
+	NewValidTo   string `json:"new_valid_to"`
+}
+
+func (h *handlers) createReschedule(w http.ResponseWriter, r *http.Request) {
+	var req createRescheduleRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	newValidFrom, errFrom := time.Parse(time.RFC3339, req.NewValidFrom)
+	newValidTo, errTo := time.Parse(time.RFC3339, req.NewValidTo)
+	if req.NewValidFrom == "" || req.NewValidTo == "" || errFrom != nil || errTo != nil {
+		respondError(w, &entitlements.Error{
+			Code:    entitlements.CodeInvalidRequest,
+			Message: "new_valid_from and new_valid_to must be RFC 3339 timestamps, e.g. 2026-02-01T00:00:00Z",
+		})
+		return
+	}
+	if !newValidFrom.Before(newValidTo) {
+		respondError(w, &entitlements.Error{
+			Code:    entitlements.CodeInvalidRequest,
+			Message: "new_valid_from must be before new_valid_to",
+		})
+		return
+	}
+	reschedule, created, err := h.service.RescheduleEntitlement(
+		r.Context(), r.PathValue("entitlementID"), req.RescheduleID, newValidFrom, newValidTo)
+	if err != nil {
+		respondError(w, err)
+		return
+	}
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	respondJSON(w, status, reschedule)
+}
+
 func (h *handlers) getEntitlement(w http.ResponseWriter, r *http.Request) {
 	view, err := h.service.GetView(r.Context(), r.PathValue("entitlementID"))
 	if err != nil {
@@ -226,6 +268,7 @@ var errorStatus = map[string]int{
 	entitlements.CodeReservationNotConfirmed: http.StatusUnprocessableEntity,
 	entitlements.CodeReservationReversed:     http.StatusConflict,
 	entitlements.CodeAdjustmentParamChanged:  http.StatusConflict,
+	entitlements.CodeRescheduleParamChanged:  http.StatusConflict,
 }
 
 func respondError(w http.ResponseWriter, err error) {

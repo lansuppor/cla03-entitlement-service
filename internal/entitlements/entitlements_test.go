@@ -871,3 +871,346 @@ func TestAdjustmentsSurviveReconnection(t *testing.T) {
 		t.Fatalf("due adjustment not applied after restart: %+v", view)
 	}
 }
+
+func TestRescheduleValidation(t *testing.T) {
+	store := testStore(t)
+	from, to := activeWindow()
+	id := uniqueID(t)
+	mustCreate(t, store, id, 100, from, to)
+	ctx := context.Background()
+	newFrom := time.Now().Add(-time.Hour).UTC().Truncate(time.Microsecond)
+	newTo := time.Now().Add(time.Hour).UTC().Truncate(time.Microsecond)
+	baseline, err := store.GetView(ctx, id)
+	if err != nil {
+		t.Fatalf("baseline view: %v", err)
+	}
+
+	// Illegal identifier, missing timestamp, reversed window, unknown
+	// entitlement.
+	_, _, err = store.RescheduleEntitlement(ctx, id, "bad id!", newFrom, newTo)
+	wantCode(t, err, CodeInvalidRequest)
+	_, _, err = store.RescheduleEntitlement(ctx, id, "move-1", time.Time{}, newTo)
+	wantCode(t, err, CodeInvalidRequest)
+	_, _, err = store.RescheduleEntitlement(ctx, id, "move-1", newFrom, time.Time{})
+	wantCode(t, err, CodeInvalidRequest)
+	_, _, err = store.RescheduleEntitlement(ctx, id, "move-1", newTo, newFrom)
+	wantCode(t, err, CodeInvalidRequest)
+	_, _, err = store.RescheduleEntitlement(ctx, id, "move-1", newFrom, newFrom)
+	wantCode(t, err, CodeInvalidRequest)
+	_, _, err = store.RescheduleEntitlement(ctx, "ent-404", "move-1", newFrom, newTo)
+	wantCode(t, err, CodeEntitlementNotFound)
+
+	// Failed attempts write neither a reschedule nor a new window.
+	view, _ := store.GetView(ctx, id)
+	if len(view.Reschedules) != 0 ||
+		!view.ValidFrom.Equal(baseline.ValidFrom) || !view.ValidTo.Equal(baseline.ValidTo) {
+		t.Fatalf("failed reschedule left partial state: %+v", view)
+	}
+}
+
+func TestRescheduleIdempotency(t *testing.T) {
+	store := testStore(t)
+	from, to := activeWindow()
+	id := uniqueID(t)
+	mustCreate(t, store, id, 100, from, to)
+	ctx := context.Background()
+	newFrom := time.Now().Add(2 * time.Hour).UTC().Truncate(time.Microsecond)
+	newTo := time.Now().Add(3 * time.Hour).UTC().Truncate(time.Microsecond)
+
+	// First submission creates the reschedule and rewrites the window.
+	first, created, err := store.RescheduleEntitlement(ctx, id, "move-1", newFrom, newTo)
+	if err != nil || !created {
+		t.Fatalf("first reschedule: %+v created=%v err=%v", first, created, err)
+	}
+	if !first.NewValidFrom.Equal(newFrom) || !first.NewValidTo.Equal(newTo) || first.CreatedAt.IsZero() {
+		t.Fatalf("reschedule record: %+v", first)
+	}
+	view, _ := store.GetView(ctx, id)
+	if !view.ValidFrom.Equal(newFrom) || !view.ValidTo.Equal(newTo) || view.Status != "pending" {
+		t.Fatalf("window not rewritten: %+v", view)
+	}
+	if len(view.Reschedules) != 1 {
+		t.Fatalf("reschedule list: %+v", view.Reschedules)
+	}
+
+	// Replaying the same identifier with the same window returns the
+	// original record and does not touch the window again.
+	before := view.Reschedules[0].CreatedAt
+	replay, created, err := store.RescheduleEntitlement(ctx, id, "move-1", newFrom, newTo)
+	if err != nil || created {
+		t.Fatalf("replay: %+v created=%v err=%v", replay, created, err)
+	}
+	if replay.RescheduleID != first.RescheduleID || !replay.CreatedAt.Equal(first.CreatedAt) {
+		t.Fatalf("replay should return the original: %+v vs %+v", replay, first)
+	}
+	view, _ = store.GetView(ctx, id)
+	if len(view.Reschedules) != 1 || !view.Reschedules[0].CreatedAt.Equal(before) {
+		t.Fatalf("replay rewrote the reschedule: %+v", view.Reschedules)
+	}
+
+	// The same identifier with a different window fails and changes nothing.
+	_, _, err = store.RescheduleEntitlement(ctx, id, "move-1", newFrom.Add(time.Hour), newTo)
+	wantCode(t, err, CodeRescheduleParamChanged)
+	_, _, err = store.RescheduleEntitlement(ctx, id, "move-1", newFrom, newTo.Add(time.Hour))
+	wantCode(t, err, CodeRescheduleParamChanged)
+	view, _ = store.GetView(ctx, id)
+	if !view.ValidFrom.Equal(newFrom) || !view.ValidTo.Equal(newTo) || len(view.Reschedules) != 1 {
+		t.Fatalf("param mismatch changed state: %+v", view)
+	}
+}
+
+func TestRescheduleChangesActiveStateNotQuota(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	id := uniqueID(t)
+	// Starts in the future: nothing can be reserved yet.
+	mustCreate(t, store, id, 100, now.Add(time.Hour), now.Add(3*time.Hour))
+	if _, _, err := store.CreateReservation(ctx, id, "res-1", 30); err != nil {
+		wantCode(t, err, CodeEntitlementNotActive)
+	}
+
+	// Occupy quota after pulling the window forward over the current time.
+	enterFrom := now.Add(-time.Hour).UTC().Truncate(time.Microsecond)
+	enterTo := now.Add(time.Hour).UTC().Truncate(time.Microsecond)
+	if _, _, err := store.RescheduleEntitlement(ctx, id, "move-enter", enterFrom, enterTo); err != nil {
+		t.Fatalf("reschedule into window: %v", err)
+	}
+	if _, _, err := store.CreateReservation(ctx, id, "res-1", 30); err != nil {
+		t.Fatalf("reserve after entering new window: %v", err)
+	}
+	if _, _, err := store.CreateReservation(ctx, id, "res-2", 20); err != nil {
+		t.Fatalf("reserve pending amount: %v", err)
+	}
+	if _, err := store.SettleReservation(ctx, id, "res-1", ActionConfirm); err != nil {
+		t.Fatalf("confirm: %v", err)
+	}
+	view, _ := store.GetView(ctx, id)
+	if view.Status != "active" || view.QuotaTotal != 100 || view.UsedAmount != 30 ||
+		view.ReservedAmount != 20 || view.AvailableAmount != 50 {
+		t.Fatalf("state after entering window: %+v", view)
+	}
+
+	// Reschedule the end to before now: new reservations are rejected, but
+	// the unsettled hold still settles and the confirmed one still reverses.
+	expireFrom := now.Add(-2 * time.Hour).UTC().Truncate(time.Microsecond)
+	expireTo := now.Add(-time.Minute).UTC().Truncate(time.Microsecond)
+	if _, _, err := store.RescheduleEntitlement(ctx, id, "move-expire", expireFrom, expireTo); err != nil {
+		t.Fatalf("reschedule into expiry: %v", err)
+	}
+	_, _, err := store.CreateReservation(ctx, id, "res-3", 1)
+	wantCode(t, err, CodeEntitlementNotActive)
+	if _, err := store.SettleReservation(ctx, id, "res-2", ActionRelease); err != nil {
+		t.Fatalf("release after new expiry: %v", err)
+	}
+	if _, _, err := store.ReverseReservation(ctx, id, "res-1", "corr-1"); err != nil {
+		t.Fatalf("reverse after new expiry: %v", err)
+	}
+	view, _ = store.GetView(ctx, id)
+	if view.Status != "expired" || !view.ValidTo.Equal(expireTo) {
+		t.Fatalf("status after new expiry: %+v", view)
+	}
+	// No quota figure moved because of the reschedules themselves.
+	if view.QuotaTotal != 100 || view.UsedAmount != 0 || view.ReservedAmount != 0 ||
+		view.AvailableAmount != 100 {
+		t.Fatalf("reschedule altered quota figures: %+v", view)
+	}
+	if len(view.Reschedules) != 2 {
+		t.Fatalf("reschedule list should keep both records: %+v", view.Reschedules)
+	}
+
+	// Pulling the window back open makes new reservations possible again.
+	reopenFrom := now.Add(-time.Hour).UTC().Truncate(time.Microsecond)
+	reopenTo := now.Add(time.Hour).UTC().Truncate(time.Microsecond)
+	if _, _, err := store.RescheduleEntitlement(ctx, id, "move-reopen", reopenFrom, reopenTo); err != nil {
+		t.Fatalf("reschedule reopen: %v", err)
+	}
+	if _, _, err := store.CreateReservation(ctx, id, "res-4", 10); err != nil {
+		t.Fatalf("reserve after reopening window: %v", err)
+	}
+	view, _ = store.GetView(ctx, id)
+	if view.Status != "active" || view.ReservedAmount != 10 || view.AvailableAmount != 90 {
+		t.Fatalf("state after reopening: %+v", view)
+	}
+}
+
+func TestRescheduleDoesNotInteractWithAdjustments(t *testing.T) {
+	store := testStore(t)
+	from, to := activeWindow()
+	id := uniqueID(t)
+	mustCreate(t, store, id, 100, from, to)
+	ctx := context.Background()
+
+	// Register a pending future increase, then reschedule into a future
+	// window: the adjustment stays pending and keeps its own effective time.
+	futureAdj := time.Now().Add(2 * time.Hour).UTC().Truncate(time.Microsecond)
+	if _, _, err := store.CreateAdjustment(ctx, id, "adj-later", 40, futureAdj); err != nil {
+		t.Fatalf("create pending adjustment: %v", err)
+	}
+	newFrom := time.Now().Add(time.Hour).UTC().Truncate(time.Microsecond)
+	newTo := time.Now().Add(4 * time.Hour).UTC().Truncate(time.Microsecond)
+	if _, _, err := store.RescheduleEntitlement(ctx, id, "move-1", newFrom, newTo); err != nil {
+		t.Fatalf("reschedule: %v", err)
+	}
+	view, _ := store.GetView(ctx, id)
+	if view.QuotaTotal != 100 || len(view.Adjustments) != 1 ||
+		view.Adjustments[0].Status != StatusPending || !view.Adjustments[0].EffectiveAt.Equal(futureAdj) {
+		t.Fatalf("reschedule disturbed the pending adjustment: %+v", view)
+	}
+	if view.Status != "pending" {
+		t.Fatalf("entitlement should be pending in its new window: %+v", view)
+	}
+
+	// An applied adjustment's counting is driven by its own effective time,
+	// not by the rescheduled window: a past increase applies even though the
+	// entitlement now lies in the future.
+	past := time.Now().Add(-time.Minute).UTC().Truncate(time.Microsecond)
+	applied, created, err := store.CreateAdjustment(ctx, id, "adj-now", 10, past)
+	if err != nil || !created || applied.Status != StatusApplied {
+		t.Fatalf("past adjustment after reschedule: %+v created=%v err=%v", applied, created, err)
+	}
+	view, _ = store.GetView(ctx, id)
+	if view.QuotaTotal != 110 || view.AvailableAmount != 110 {
+		t.Fatalf("applied adjustment not counted: %+v", view)
+	}
+
+	// Moving the window back open leaves the applied total intact and the
+	// still-future adjustment still pending; reservations check against 110.
+	reopenFrom := time.Now().Add(-time.Hour).UTC().Truncate(time.Microsecond)
+	reopenTo := time.Now().Add(5 * time.Hour).UTC().Truncate(time.Microsecond)
+	if _, _, err := store.RescheduleEntitlement(ctx, id, "move-2", reopenFrom, reopenTo); err != nil {
+		t.Fatalf("reschedule reopen: %v", err)
+	}
+	if _, _, err := store.CreateReservation(ctx, id, "res-1", 110); err != nil {
+		t.Fatalf("reserve against adjusted total: %v", err)
+	}
+	view, _ = store.GetView(ctx, id)
+	if view.QuotaTotal != 110 || view.ReservedAmount != 110 || view.AvailableAmount != 0 ||
+		view.Adjustments[0].Status != StatusPending {
+		t.Fatalf("state after reopening: %+v", view)
+	}
+}
+
+func TestReschedulesOrderedInView(t *testing.T) {
+	store := testStore(t)
+	from, to := activeWindow()
+	id := uniqueID(t)
+	mustCreate(t, store, id, 100, from, to)
+	ctx := context.Background()
+	base := time.Now().UTC().Truncate(time.Microsecond)
+	for i, rc := range []struct {
+		id             string
+		fromOff, toOff time.Duration
+	}{
+		{"move-1", time.Hour, 2 * time.Hour},
+		{"move-2", -time.Hour, 3 * time.Hour},
+		{"move-3", -2 * time.Hour, -time.Minute},
+	} {
+		if _, _, err := store.RescheduleEntitlement(ctx, id, rc.id, base.Add(rc.fromOff), base.Add(rc.toOff)); err != nil {
+			t.Fatalf("reschedule %d: %v", i, err)
+		}
+	}
+	view, _ := store.GetView(ctx, id)
+	if len(view.Reschedules) != 3 {
+		t.Fatalf("reschedule list: %+v", view.Reschedules)
+	}
+	for i, wantID := range []string{"move-1", "move-2", "move-3"} {
+		if view.Reschedules[i].RescheduleID != wantID ||
+			view.Reschedules[i].NewValidFrom.IsZero() || view.Reschedules[i].NewValidTo.IsZero() ||
+			view.Reschedules[i].CreatedAt.IsZero() {
+			t.Fatalf("reschedule entry %d: %+v", i, view.Reschedules[i])
+		}
+	}
+	// The view's window reflects the latest reschedule.
+	last := view.Reschedules[2]
+	if !view.ValidFrom.Equal(last.NewValidFrom) || !view.ValidTo.Equal(last.NewValidTo) || view.Status != "expired" {
+		t.Fatalf("view window should reflect latest reschedule: %+v", view)
+	}
+}
+
+func TestConcurrentReschedulesRewriteOnce(t *testing.T) {
+	store := testStore(t)
+	from, to := activeWindow()
+	id := uniqueID(t)
+	mustCreate(t, store, id, 100, from, to)
+	ctx := context.Background()
+	newFrom := time.Now().Add(-time.Hour).UTC().Truncate(time.Microsecond)
+	newTo := time.Now().Add(2 * time.Hour).UTC().Truncate(time.Microsecond)
+
+	// Many workers submit the same reschedule identifier and also hammer the
+	// entitlement with quota operations; all serialize on the row lock.
+	const workers = 8
+	var wg sync.WaitGroup
+	errs := make(chan error, workers*4)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			if _, _, err := store.RescheduleEntitlement(ctx, id, "move-1", newFrom, newTo); err != nil {
+				errs <- err
+			}
+			if _, _, err := store.RescheduleEntitlement(ctx, id, "move-1", newFrom, newTo); err != nil {
+				errs <- err
+			}
+			rid := fmt.Sprintf("res-%d", w)
+			if _, _, err := store.CreateReservation(ctx, id, rid, 5); err != nil {
+				errs <- err
+				return
+			}
+			_, _ = store.SettleReservation(ctx, id, rid, ActionConfirm)
+		}(w)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("unexpected concurrent failure: %v", err)
+	}
+	view, err := store.GetView(ctx, id)
+	if err != nil {
+		t.Fatalf("view: %v", err)
+	}
+	if len(view.Reschedules) != 1 || !view.ValidFrom.Equal(newFrom) || !view.ValidTo.Equal(newTo) {
+		t.Fatalf("reschedule applied more than once: %+v", view)
+	}
+	if view.UsedAmount != workers*5 || view.QuotaTotal != 100 ||
+		view.AvailableAmount != 100-view.UsedAmount {
+		t.Fatalf("quota state after concurrent reschedules: %+v", view)
+	}
+}
+
+func TestReschedulesSurviveReconnection(t *testing.T) {
+	store := testStore(t)
+	from, to := activeWindow()
+	id := uniqueID(t)
+	mustCreate(t, store, id, 100, from, to)
+	ctx := context.Background()
+	newFrom := time.Now().Add(-time.Hour).UTC().Truncate(time.Microsecond)
+	newTo := time.Now().Add(-time.Minute).UTC().Truncate(time.Microsecond)
+	if _, _, err := store.RescheduleEntitlement(ctx, id, "move-1", newFrom, newTo); err != nil {
+		t.Fatalf("reschedule: %v", err)
+	}
+
+	// A fresh pool over the same database simulates a service restart.
+	pool, err := pgxpool.New(ctx, os.Getenv("TEST_DATABASE_URL"))
+	if err != nil {
+		t.Fatalf("reconnect: %v", err)
+	}
+	defer pool.Close()
+	restarted := NewStore(pool)
+	view, err := restarted.GetView(ctx, id)
+	if err != nil {
+		t.Fatalf("view after restart: %v", err)
+	}
+	if !view.ValidFrom.Equal(newFrom) || !view.ValidTo.Equal(newTo) ||
+		view.Status != "expired" || len(view.Reschedules) != 1 {
+		t.Fatalf("rescheduled window lost across restart: %+v", view)
+	}
+	// The reschedule identifier is still replayed, not re-applied.
+	replay, created, err := restarted.RescheduleEntitlement(ctx, id, "move-1", newFrom, newTo)
+	if err != nil || created || !replay.NewValidFrom.Equal(newFrom) {
+		t.Fatalf("reschedule replay after restart: %+v created=%v err=%v", replay, created, err)
+	}
+	// New reservations stay blocked by the persisted, already-expired window.
+	_, _, err = restarted.CreateReservation(ctx, id, "res-1", 1)
+	wantCode(t, err, CodeEntitlementNotActive)
+}

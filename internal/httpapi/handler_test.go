@@ -51,6 +51,7 @@ type fakeService struct {
 	reservation  entitlements.Reservation
 	reversal     entitlements.Reversal
 	adjustment   entitlements.Adjustment
+	reschedule   entitlements.Reschedule
 	created      bool
 	view         entitlements.View
 	err          error
@@ -58,6 +59,7 @@ type fakeService struct {
 	reversalID   string
 	adjustmentID string
 	delta        int64
+	rescheduleID string
 }
 
 func (f *fakeService) CreateEntitlement(_ context.Context, _ entitlements.CreateEntitlementInput) (entitlements.Entitlement, error) {
@@ -82,6 +84,11 @@ func (f *fakeService) CreateAdjustment(_ context.Context, _, adjustmentID string
 	f.adjustmentID = adjustmentID
 	f.delta = delta
 	return f.adjustment, f.created, f.err
+}
+
+func (f *fakeService) RescheduleEntitlement(_ context.Context, _, rescheduleID string, _, _ time.Time) (entitlements.Reschedule, bool, error) {
+	f.rescheduleID = rescheduleID
+	return f.reschedule, f.created, f.err
 }
 
 func (f *fakeService) GetView(_ context.Context, _ string) (entitlements.View, error) {
@@ -134,6 +141,7 @@ func TestErrorMapping(t *testing.T) {
 		{"not confirmed", entitlements.CodeReservationNotConfirmed, 422},
 		{"already reversed", entitlements.CodeReservationReversed, 409},
 		{"adjustment param mismatch", entitlements.CodeAdjustmentParamChanged, 409},
+		{"reschedule param mismatch", entitlements.CodeRescheduleParamChanged, 409},
 		{"internal", "unmapped", 500},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -251,6 +259,53 @@ func TestAdjustmentRoute(t *testing.T) {
 		`{"delta":20,"effective_at":"2026-06-01T00:00:00Z"}`)
 	if response.Code != 400 || !strings.Contains(response.Body.String(), `"invalid_request"`) {
 		t.Fatalf("missing adjustment_id: status=%d body=%q", response.Code, response.Body.String())
+	}
+}
+
+func TestRescheduleRoute(t *testing.T) {
+	reschedule := entitlements.Reschedule{
+		RescheduleID: "move-1",
+		NewValidFrom: time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC),
+		NewValidTo:   time.Date(2027, 2, 1, 0, 0, 0, 0, time.UTC),
+		CreatedAt:    time.Now(),
+	}
+	service := &fakeService{reschedule: reschedule, created: true}
+	created := serve(t, service, "POST", "/entitlements/ent-1/reschedules",
+		`{"reschedule_id":"move-1","new_valid_from":"2026-02-01T00:00:00Z","new_valid_to":"2027-02-01T00:00:00Z"}`)
+	if created.Code != 201 || service.rescheduleID != "move-1" {
+		t.Fatalf("new reschedule: status=%d reschedule_id=%q body=%q",
+			created.Code, service.rescheduleID, created.Body.String())
+	}
+	if !strings.Contains(created.Body.String(), `"reschedule_id":"move-1"`) {
+		t.Fatalf("reschedule body: %q", created.Body.String())
+	}
+	service.created = false
+	replayed := serve(t, service, "POST", "/entitlements/ent-1/reschedules",
+		`{"reschedule_id":"move-1","new_valid_from":"2026-02-01T00:00:00Z","new_valid_to":"2027-02-01T00:00:00Z"}`)
+	if replayed.Code != 200 {
+		t.Fatalf("replayed reschedule: status=%d body=%q", replayed.Code, replayed.Body.String())
+	}
+	// Missing timestamps, unparseable timestamps, a reversed window, unknown
+	// fields and malformed JSON are rejected before the domain is called.
+	for _, body := range []string{
+		`{"reschedule_id":"move-1","new_valid_to":"2027-02-01T00:00:00Z"}`,
+		`{"reschedule_id":"move-1","new_valid_from":"2026-02-01T00:00:00Z"}`,
+		`{"reschedule_id":"move-1","new_valid_from":"soon","new_valid_to":"2027-02-01T00:00:00Z"}`,
+		`{"reschedule_id":"move-1","new_valid_from":"2027-02-01T00:00:00Z","new_valid_to":"2026-02-01T00:00:00Z"}`,
+		`{"reschedule_id":"move-1","new_valid_from":"2026-02-01T00:00:00Z","new_valid_to":"2026-02-01T00:00:00Z","delta":1}`,
+		`{`,
+	} {
+		response := serve(t, service, "POST", "/entitlements/ent-1/reschedules", body)
+		if response.Code != 400 || !strings.Contains(response.Body.String(), `"invalid_request"`) {
+			t.Fatalf("body %q: status=%d body=%q", body, response.Code, response.Body.String())
+		}
+	}
+	// A missing reschedule_id reaches the domain, which rejects it.
+	invalid := &fakeService{err: &entitlements.Error{Code: entitlements.CodeInvalidRequest, Message: "bad reschedule_id"}}
+	response := serve(t, invalid, "POST", "/entitlements/ent-1/reschedules",
+		`{"new_valid_from":"2026-02-01T00:00:00Z","new_valid_to":"2027-02-01T00:00:00Z"}`)
+	if response.Code != 400 || !strings.Contains(response.Body.String(), `"invalid_request"`) {
+		t.Fatalf("missing reschedule_id: status=%d body=%q", response.Code, response.Body.String())
 	}
 }
 
