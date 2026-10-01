@@ -29,7 +29,7 @@ func TestHealthAndReadiness(t *testing.T) {
 					t.Error("readiness database check must have a deadline")
 				}
 				return tc.dbError
-			})
+			}, nil)
 			response := httptest.NewRecorder()
 			handler.ServeHTTP(response, httptest.NewRequest(tc.method, tc.path, nil))
 			if response.Code != tc.status || !strings.Contains(response.Body.String(), tc.body) || calls != tc.calls {

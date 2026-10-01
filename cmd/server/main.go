@@ -12,6 +12,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/lansolocoder/cla03-entitlement-service/internal/httpapi"
+	"github.com/lansolocoder/cla03-entitlement-service/internal/store"
 )
 
 func main() {
@@ -26,12 +27,28 @@ func main() {
 		log.Fatal("invalid database configuration")
 	}
 	defer pool.Close()
+
+	pingCtx, cancelPing := context.WithTimeout(ctx, 10*time.Second)
+	if err := pool.Ping(pingCtx); err != nil {
+		cancelPing()
+		log.Fatal("cannot reach database: ", err)
+	}
+	cancelPing()
+
+	entitlementStore := store.New(pool)
+	migrateCtx, cancelMigrate := context.WithTimeout(ctx, 30*time.Second)
+	if err := entitlementStore.Migrate(migrateCtx); err != nil {
+		cancelMigrate()
+		log.Fatal("database migration failed: ", err)
+	}
+	cancelMigrate()
+
 	address := os.Getenv("LISTEN_ADDR")
 	if address == "" {
 		address = "127.0.0.1:8080"
 	}
 	server := &http.Server{
-		Addr: address, Handler: httpapi.New(pool.Ping),
+		Addr: address, Handler: httpapi.New(pool.Ping, entitlementStore),
 		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second,
 		WriteTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second,
 	}
