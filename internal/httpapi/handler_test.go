@@ -47,11 +47,11 @@ func TestHealthAndReadiness(t *testing.T) {
 
 // fakeService records calls and returns scripted results.
 type fakeService struct {
-	entitlement entitlements.Entitlement
-	reservation entitlements.Reservation
-	created     bool
-	view        entitlements.View
-	err         error
+	entitlement  entitlements.Entitlement
+	reservation  entitlements.Reservation
+	created      bool
+	view         entitlements.View
+	err          error
 	settleAction string
 }
 
@@ -66,6 +66,10 @@ func (f *fakeService) CreateReservation(_ context.Context, _, _ string, _ int64)
 func (f *fakeService) SettleReservation(_ context.Context, _, _, action string) (entitlements.Reservation, error) {
 	f.settleAction = action
 	return f.reservation, f.err
+}
+
+func (f *fakeService) ReverseReservation(_ context.Context, _, _, _ string) (entitlements.Reservation, bool, error) {
+	return f.reservation, f.created, f.err
 }
 
 func (f *fakeService) GetView(_ context.Context, _ string) (entitlements.View, error) {
@@ -156,6 +160,43 @@ func TestSettleRoutes(t *testing.T) {
 	response = serve(t, service, "POST", "/entitlements/ent-1/reservations/r1/release", "")
 	if response.Code != 200 || service.settleAction != entitlements.ActionRelease {
 		t.Fatalf("release: status=%d action=%q", response.Code, service.settleAction)
+	}
+}
+
+func TestReverseRoute(t *testing.T) {
+	service := &fakeService{
+		reservation: entitlements.Reservation{
+			Kind: entitlements.StatusReversed, ReversalID: "corr-1",
+			ReversalOf: "r1", Amount: -5, Status: entitlements.StatusReversed,
+		},
+		created: true,
+	}
+	response := serve(t, service, "POST", "/entitlements/ent-1/reservations/r1/reverse", `{"reversal_id":"corr-1"}`)
+	if response.Code != 201 || !strings.Contains(response.Body.String(), `"reversal_id":"corr-1"`) ||
+		!strings.Contains(response.Body.String(), `"amount":-5`) {
+		t.Fatalf("new reversal: status=%d body=%q", response.Code, response.Body.String())
+	}
+
+	// A replay returns 200.
+	service.created = false
+	response = serve(t, service, "POST", "/entitlements/ent-1/reservations/r1/reverse", `{"reversal_id":"corr-1"}`)
+	if response.Code != 200 {
+		t.Fatalf("replayed reversal: status=%d body=%q", response.Code, response.Body.String())
+	}
+
+	for _, tc := range []struct {
+		name, body string
+	}{
+		{"missing reversal_id", `{}`},
+		{"malformed json", `{`},
+		{"unknown field", `{"reversal_id":"corr-1","amount":5}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			response := serve(t, &fakeService{}, "POST", "/entitlements/ent-1/reservations/r1/reverse", tc.body)
+			if response.Code != 400 || !strings.Contains(response.Body.String(), `"invalid_request"`) {
+				t.Fatalf("status=%d body=%q", response.Code, response.Body.String())
+			}
+		})
 	}
 }
 

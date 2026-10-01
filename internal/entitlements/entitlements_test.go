@@ -294,6 +294,220 @@ func TestConcurrentReservationsNeverExceedQuota(t *testing.T) {
 	}
 }
 
+func confirmRes(t *testing.T, store *Store, id, rid string, amount int64) {
+	t.Helper()
+	ctx := context.Background()
+	if _, _, err := store.CreateReservation(ctx, id, rid, amount); err != nil {
+		t.Fatalf("reserve %s: %v", rid, err)
+	}
+	if _, err := store.SettleReservation(ctx, id, rid, ActionConfirm); err != nil {
+		t.Fatalf("confirm %s: %v", rid, err)
+	}
+}
+
+func TestReverseConfirmedReservation(t *testing.T) {
+	store := testStore(t)
+	from, to := activeWindow()
+	id := uniqueID(t)
+	mustCreate(t, store, id, 100, from, to)
+	ctx := context.Background()
+	confirmRes(t, store, id, "res-1", 30)
+
+	reversal, created, err := store.ReverseReservation(ctx, id, "res-1", "corr-1")
+	if err != nil || !created {
+		t.Fatalf("reverse: %+v created=%v err=%v", reversal, created, err)
+	}
+	if reversal.Kind != StatusReversed || reversal.Status != StatusReversed ||
+		reversal.ReversalID != "corr-1" || reversal.ReversalOf != "res-1" || reversal.Amount != -30 ||
+		reversal.SettledAt == nil {
+		t.Fatalf("reversal record: %+v", reversal)
+	}
+
+	// The original confirmation is untouched and both rows appear in the list.
+	view, _ := store.GetView(ctx, id)
+	if view.UsedAmount != 0 || view.ReservedAmount != 0 || view.AvailableAmount != 100 {
+		t.Fatalf("quota after reversal: %+v", view)
+	}
+	if len(view.Reservations) != 2 {
+		t.Fatalf("ledger should keep both rows: %+v", view.Reservations)
+	}
+	original := view.Reservations[0]
+	reversed := view.Reservations[1]
+	if original.ReservationID != "res-1" || original.Status != StatusConfirmed || original.Amount != 30 {
+		t.Fatalf("original confirmation altered: %+v", original)
+	}
+	if reversed.ReversalID != "corr-1" || reversed.ReversalOf != "res-1" ||
+		reversed.Status != StatusReversed || reversed.Amount != -30 {
+		t.Fatalf("reversal ledger row: %+v", reversed)
+	}
+}
+
+func TestReverseIdempotencyAndConflicts(t *testing.T) {
+	store := testStore(t)
+	from, to := activeWindow()
+	id := uniqueID(t)
+	mustCreate(t, store, id, 100, from, to)
+	ctx := context.Background()
+	confirmRes(t, store, id, "res-1", 30)
+	confirmRes(t, store, id, "res-2", 20)
+
+	first, created, err := store.ReverseReservation(ctx, id, "res-1", "corr-1")
+	if err != nil || !created || first.Amount != -30 {
+		t.Fatalf("first reverse: %+v created=%v err=%v", first, created, err)
+	}
+	// Identical replay returns the same result and does not refund again.
+	replay, created, err := store.ReverseReservation(ctx, id, "res-1", "corr-1")
+	if err != nil || created ||
+		replay.ReversalID != first.ReversalID || replay.ReversalOf != first.ReversalOf ||
+		replay.Amount != first.Amount || !replay.CreatedAt.Equal(first.CreatedAt) ||
+		replay.SettledAt == nil || !replay.SettledAt.Equal(*first.SettledAt) {
+		t.Fatalf("replay should return original: %+v created=%v err=%v", replay, created, err)
+	}
+	view, _ := store.GetView(ctx, id)
+	if view.UsedAmount != 20 || view.AvailableAmount != 80 || len(view.Reservations) != 3 {
+		t.Fatalf("replay refunded twice: %+v", view)
+	}
+
+	// Same correction id aimed at another reservation fails and changes nothing.
+	_, _, err = store.ReverseReservation(ctx, id, "res-2", "corr-1")
+	wantCode(t, err, CodeReservationParamChanged)
+
+	// A reservation can be reversed at most once, even with a new id.
+	_, _, err = store.ReverseReservation(ctx, id, "res-1", "corr-2")
+	wantCode(t, err, CodeReservationSettled)
+	view, _ = store.GetView(ctx, id)
+	if view.UsedAmount != 20 || view.AvailableAmount != 80 {
+		t.Fatalf("failed re-reversal changed state: %+v", view)
+	}
+
+	// The second reservation can still be corrected with its own id.
+	if _, _, err := store.ReverseReservation(ctx, id, "res-2", "corr-3"); err != nil {
+		t.Fatalf("reverse res-2: %v", err)
+	}
+	view, _ = store.GetView(ctx, id)
+	if view.UsedAmount != 0 || view.AvailableAmount != 100 || len(view.Reservations) != 4 {
+		t.Fatalf("quota after both reversals: %+v", view)
+	}
+}
+
+func TestReverseRejectsInvalidTargets(t *testing.T) {
+	store := testStore(t)
+	from, to := activeWindow()
+	id := uniqueID(t)
+	mustCreate(t, store, id, 100, from, to)
+	ctx := context.Background()
+
+	// Pending reservation cannot be reversed.
+	if _, _, err := store.CreateReservation(ctx, id, "res-pending", 10); err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	_, _, err := store.ReverseReservation(ctx, id, "res-pending", "c1")
+	wantCode(t, err, CodeReservationSettled)
+
+	// Released reservation cannot be reversed.
+	if _, _, err := store.CreateReservation(ctx, id, "res-released", 10); err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	if _, err := store.SettleReservation(ctx, id, "res-released", ActionRelease); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	_, _, err = store.ReverseReservation(ctx, id, "res-released", "c2")
+	wantCode(t, err, CodeReservationSettled)
+
+	// Unknown reservation and unknown entitlement.
+	_, _, err = store.ReverseReservation(ctx, id, "res-404", "c3")
+	wantCode(t, err, CodeReservationNotFound)
+	_, _, err = store.ReverseReservation(ctx, "ent-404", "res-1", "c4")
+	wantCode(t, err, CodeEntitlementNotFound)
+
+	// Bad correction identifier.
+	_, _, err = store.ReverseReservation(ctx, id, "res-pending", "bad id!")
+	wantCode(t, err, CodeInvalidRequest)
+
+	view, _ := store.GetView(ctx, id)
+	if view.UsedAmount != 0 || view.AvailableAmount != 90 || view.ReservedAmount != 10 {
+		t.Fatalf("rejected reversals changed state: %+v", view)
+	}
+}
+
+func TestReverseAfterExpiry(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	id := uniqueID(t)
+	mustCreate(t, store, id, 100, now.Add(-time.Hour), now.Add(time.Hour))
+	confirmRes(t, store, id, "res-1", 40)
+	if _, err := store.pool.Exec(ctx, `UPDATE entitlements SET valid_to = now() - interval '1 minute' WHERE entitlement_id = $1`, id); err != nil {
+		t.Fatalf("expire: %v", err)
+	}
+	// New reservations stay blocked after expiry...
+	_, _, err := store.CreateReservation(ctx, id, "res-new", 1)
+	wantCode(t, err, CodeEntitlementNotActive)
+	// ...but correcting a confirmed reservation is still allowed.
+	if _, _, err := store.ReverseReservation(ctx, id, "res-1", "corr-1"); err != nil {
+		t.Fatalf("reverse after expiry: %v", err)
+	}
+	view, _ := store.GetView(ctx, id)
+	if view.Status != "expired" || view.UsedAmount != 0 || view.AvailableAmount != 100 {
+		t.Fatalf("view after expired reversal: %+v", view)
+	}
+}
+
+func TestConcurrentReversalsApplyOnce(t *testing.T) {
+	store := testStore(t)
+	from, to := activeWindow()
+	id := uniqueID(t)
+	const quota = 100
+	mustCreate(t, store, id, quota, from, to)
+	ctx := context.Background()
+	const n = 10
+	for i := 0; i < n; i++ {
+		confirmRes(t, store, id, fmt.Sprintf("res-%d", i), 10)
+	}
+
+	// Two different correction ids racing on each reservation; exactly one
+	// must win, and duplicate-id replays must not refund twice.
+	var wg sync.WaitGroup
+	errs := make(chan error, n*4)
+	for i := 0; i < n; i++ {
+		rid := fmt.Sprintf("res-%d", i)
+		for _, cid := range []string{rid + "-a", rid + "-b"} {
+			wg.Add(1)
+			go func(rid, cid string) {
+				defer wg.Done()
+				if _, _, err := store.ReverseReservation(ctx, id, rid, cid); err != nil {
+					errs <- err
+				}
+			}(rid, cid)
+			wg.Add(1)
+			go func(rid, cid string) { // duplicate replay of -a
+				defer wg.Done()
+				if _, _, err := store.ReverseReservation(ctx, id, rid, rid+"-a"); err != nil {
+					errs <- err
+				}
+			}(rid, cid)
+		}
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		var domainErr *Error
+		if !errors.As(err, &domainErr) || domainErr.Code != CodeReservationSettled {
+			t.Fatalf("unexpected concurrent failure: %v", err)
+		}
+	}
+	view, err := store.GetView(ctx, id)
+	if err != nil {
+		t.Fatalf("view: %v", err)
+	}
+	if view.UsedAmount != 0 || view.AvailableAmount != quota {
+		t.Fatalf("each reservation reversed once: used=%d available=%d", view.UsedAmount, view.AvailableAmount)
+	}
+	if view.UsedAmount+view.ReservedAmount > quota {
+		t.Fatalf("invariant violated: %+v", view)
+	}
+}
+
 func TestStateSurvivesReconnection(t *testing.T) {
 	store := testStore(t)
 	from, to := activeWindow()
