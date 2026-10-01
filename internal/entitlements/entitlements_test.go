@@ -535,3 +535,307 @@ func TestStateSurvivesReconnection(t *testing.T) {
 		t.Fatalf("reversal replay after restart: %+v created=%v err=%v", replay, created, err)
 	}
 }
+
+func TestAdjustmentValidation(t *testing.T) {
+	store := testStore(t)
+	from, to := activeWindow()
+	id := uniqueID(t)
+	mustCreate(t, store, id, 100, from, to)
+	ctx := context.Background()
+	now := time.Now()
+
+	for _, tc := range []struct {
+		name         string
+		adjustmentID string
+		delta        int64
+		effectiveAt  time.Time
+		wantCode     string
+	}{
+		{"empty id", "", 10, now, CodeInvalidRequest},
+		{"bad id chars", "bad id!", 10, now, CodeInvalidRequest},
+		{"zero delta", "adj-1", 0, now, CodeInvalidRequest},
+		{"missing effective time", "adj-1", 10, time.Time{}, CodeInvalidRequest},
+		{"delta empties the quota", "adj-1", -100, now, CodeAdjustmentNonPositive},
+		{"delta exceeds the quota", "adj-1", -101, now, CodeAdjustmentNonPositive},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, err := store.CreateAdjustment(ctx, id, tc.adjustmentID, tc.delta, tc.effectiveAt)
+			wantCode(t, err, tc.wantCode)
+		})
+	}
+	_, _, err := store.CreateAdjustment(ctx, "ent-404", "adj-1", 10, now)
+	wantCode(t, err, CodeEntitlementNotFound)
+
+	// Failed attempts leave no partial state.
+	view, _ := store.GetView(ctx, id)
+	if view.QuotaTotal != 100 || len(view.Adjustments) != 0 {
+		t.Fatalf("failed adjustments left partial state: %+v", view)
+	}
+}
+
+func TestAdjustmentIdempotency(t *testing.T) {
+	store := testStore(t)
+	from, to := activeWindow()
+	id := uniqueID(t)
+	mustCreate(t, store, id, 100, from, to)
+	ctx := context.Background()
+	effectiveAt := time.Now().Add(-time.Minute)
+
+	first, created, err := store.CreateAdjustment(ctx, id, "adj-1", 40, effectiveAt)
+	if err != nil || !created || first.Status != StatusApplied || first.AppliedAt == nil {
+		t.Fatalf("first create: %+v created=%v err=%v", first, created, err)
+	}
+	view, _ := store.GetView(ctx, id)
+	if view.QuotaTotal != 140 || view.AvailableAmount != 140 {
+		t.Fatalf("increase not counted: %+v", view)
+	}
+
+	// Replaying the same parameters returns the original and changes nothing.
+	replay, created, err := store.CreateAdjustment(ctx, id, "adj-1", 40, effectiveAt)
+	if err != nil || created {
+		t.Fatalf("replay: %+v created=%v err=%v", replay, created, err)
+	}
+	if replay.AdjustmentID != first.AdjustmentID || replay.Delta != first.Delta ||
+		!replay.EffectiveAt.Equal(first.EffectiveAt) || !replay.CreatedAt.Equal(first.CreatedAt) ||
+		replay.Status != first.Status || !replay.AppliedAt.Equal(*first.AppliedAt) {
+		t.Fatalf("replay should return the original: %+v vs %+v", replay, first)
+	}
+	view, _ = store.GetView(ctx, id)
+	if view.QuotaTotal != 140 || len(view.Adjustments) != 1 {
+		t.Fatalf("replay counted the adjustment again: %+v", view)
+	}
+
+	// The same identifier with a different delta or effective time fails and
+	// changes nothing.
+	_, _, err = store.CreateAdjustment(ctx, id, "adj-1", 50, effectiveAt)
+	wantCode(t, err, CodeAdjustmentParamChanged)
+	_, _, err = store.CreateAdjustment(ctx, id, "adj-1", 40, effectiveAt.Add(time.Hour))
+	wantCode(t, err, CodeAdjustmentParamChanged)
+	view, _ = store.GetView(ctx, id)
+	if view.QuotaTotal != 140 || len(view.Adjustments) != 1 {
+		t.Fatalf("param mismatch changed state: %+v", view)
+	}
+}
+
+func TestAdjustmentTakesEffectAtEffectiveTime(t *testing.T) {
+	store := testStore(t)
+	from, to := activeWindow()
+	id := uniqueID(t)
+	mustCreate(t, store, id, 100, from, to)
+	ctx := context.Background()
+
+	// A future adjustment is recorded and visible but not yet counted.
+	adjustment, created, err := store.CreateAdjustment(ctx, id, "adj-future", 25, time.Now().Add(time.Hour))
+	if err != nil || !created || adjustment.Status != StatusPending || adjustment.AppliedAt != nil {
+		t.Fatalf("future adjustment: %+v created=%v err=%v", adjustment, created, err)
+	}
+	view, _ := store.GetView(ctx, id)
+	if view.QuotaTotal != 100 || view.AvailableAmount != 100 || len(view.Adjustments) != 1 ||
+		view.Adjustments[0].Status != StatusPending {
+		t.Fatalf("pending adjustment changed the quota: %+v", view)
+	}
+
+	// Once the effective time arrives, the next operation counts it exactly
+	// once. The SQL update simulates the clock reaching the effective time.
+	if _, err := store.pool.Exec(ctx, `
+UPDATE adjustments SET effective_at = now() - interval '1 minute'
+WHERE entitlement_id = $1 AND adjustment_id = 'adj-future'`, id); err != nil {
+		t.Fatalf("reach effective time: %v", err)
+	}
+	view, _ = store.GetView(ctx, id)
+	if view.QuotaTotal != 125 || view.AvailableAmount != 125 ||
+		view.Adjustments[0].Status != StatusApplied || view.Adjustments[0].AppliedAt == nil {
+		t.Fatalf("due adjustment not counted: %+v", view)
+	}
+	// A late replay of the same request does not count it again. (The test
+	// moved the effective time in the database, so the replay mismatches the
+	// stored parameters and is rejected without touching the quota.)
+	_, _, err = store.CreateAdjustment(ctx, id, "adj-future", 25, time.Now().Add(time.Hour))
+	wantCode(t, err, CodeAdjustmentParamChanged)
+	view, _ = store.GetView(ctx, id)
+	if view.QuotaTotal != 125 || len(view.Adjustments) != 1 {
+		t.Fatalf("adjustment counted twice: %+v", view)
+	}
+}
+
+func TestAdjustmentDecreaseWaitsForOccupiedQuota(t *testing.T) {
+	store := testStore(t)
+	from, to := activeWindow()
+	id := uniqueID(t)
+	mustCreate(t, store, id, 100, from, to)
+	ctx := context.Background()
+
+	// 60 of 100 is occupied: 30 confirmed (used) plus 30 held (reserved).
+	if _, _, err := store.CreateReservation(ctx, id, "res-used", 30); err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	if _, err := store.SettleReservation(ctx, id, "res-used", ActionConfirm); err != nil {
+		t.Fatalf("confirm: %v", err)
+	}
+	if _, _, err := store.CreateReservation(ctx, id, "res-held", 30); err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+
+	// A decrease to 50 cannot take effect while 60 is occupied: it stays
+	// pending and the quota total is unchanged.
+	effectiveAt := time.Now().Add(-time.Minute)
+	adjustment, created, err := store.CreateAdjustment(ctx, id, "adj-cut", -50, effectiveAt)
+	if err != nil || !created || adjustment.Status != StatusPending {
+		t.Fatalf("blocked decrease: %+v created=%v err=%v", adjustment, created, err)
+	}
+	view, _ := store.GetView(ctx, id)
+	if view.QuotaTotal != 100 || view.UsedAmount != 30 || view.ReservedAmount != 30 ||
+		len(view.Adjustments) != 1 || view.Adjustments[0].Status != StatusPending {
+		t.Fatalf("blocked decrease changed the quota: %+v", view)
+	}
+	// Replaying the blocked decrease returns the pending record unchanged.
+	replay, created, err := store.CreateAdjustment(ctx, id, "adj-cut", -50, effectiveAt)
+	if err != nil || created || replay.Status != StatusPending {
+		t.Fatalf("replay of blocked decrease: %+v created=%v err=%v", replay, created, err)
+	}
+
+	// Releasing the hold drops the occupied amount to 30 (used only), which
+	// fits the decreased total of 50: the next operation applies the decrease
+	// automatically.
+	if _, err := store.SettleReservation(ctx, id, "res-held", ActionRelease); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	view, _ = store.GetView(ctx, id)
+	if view.QuotaTotal != 50 || view.Adjustments[0].Status != StatusApplied {
+		t.Fatalf("decrease should apply once occupancy fits: %+v", view)
+	}
+	if view.UsedAmount+view.ReservedAmount > view.QuotaTotal {
+		t.Fatalf("invariant violated: %+v", view)
+	}
+	// The decrease was counted exactly once and the available quota reflects
+	// the new total.
+	if view.UsedAmount != 30 || view.AvailableAmount != 20 {
+		t.Fatalf("quota after decrease: %+v", view)
+	}
+	// New reservations are bounded by the decreased total.
+	_, _, err = store.CreateReservation(ctx, id, "res-over", 21)
+	wantCode(t, err, CodeInsufficientQuota)
+	if _, _, err := store.CreateReservation(ctx, id, "res-fit", 20); err != nil {
+		t.Fatalf("reserve within decreased total: %v", err)
+	}
+}
+
+func TestAdjustmentDecreaseNeverPartiallyApplies(t *testing.T) {
+	store := testStore(t)
+	from, to := activeWindow()
+	id := uniqueID(t)
+	mustCreate(t, store, id, 100, from, to)
+	ctx := context.Background()
+	if _, _, err := store.CreateReservation(ctx, id, "res-1", 80); err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	if _, err := store.SettleReservation(ctx, id, "res-1", ActionConfirm); err != nil {
+		t.Fatalf("confirm: %v", err)
+	}
+	// 80 used: a decrease to 70 stays pending, a later increase to 130 lets
+	// it apply as 130 - 30 = 100 >= 80.
+	if _, _, err := store.CreateAdjustment(ctx, id, "adj-cut", -30, time.Now().Add(-time.Minute)); err != nil {
+		t.Fatalf("decrease: %v", err)
+	}
+	view, _ := store.GetView(ctx, id)
+	if view.QuotaTotal != 100 || view.Adjustments[0].Status != StatusPending {
+		t.Fatalf("decrease should wait for occupancy: %+v", view)
+	}
+	if _, _, err := store.CreateAdjustment(ctx, id, "adj-up", 30, time.Now().Add(-time.Minute)); err != nil {
+		t.Fatalf("increase: %v", err)
+	}
+	view, _ = store.GetView(ctx, id)
+	if view.QuotaTotal != 100 || view.Adjustments[0].Status != StatusApplied ||
+		view.Adjustments[1].Status != StatusApplied {
+		t.Fatalf("increase should unblock the pending decrease: %+v", view)
+	}
+	if view.UsedAmount != 80 || view.AvailableAmount != 20 {
+		t.Fatalf("quota after both adjustments: %+v", view)
+	}
+}
+
+func TestConcurrentAdjustmentsCountOnce(t *testing.T) {
+	store := testStore(t)
+	from, to := activeWindow()
+	id := uniqueID(t)
+	const quota = 100
+	mustCreate(t, store, id, quota, from, to)
+	ctx := context.Background()
+
+	const workers = 8
+	effectiveAt := time.Now().Add(-time.Minute)
+	var wg sync.WaitGroup
+	errs := make(chan error, workers*2)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			aid := fmt.Sprintf("adj-%d", w)
+			// Each worker submits one increase and replays it; the replay must
+			// not count the delta again.
+			if _, _, err := store.CreateAdjustment(ctx, id, aid, 10, effectiveAt); err != nil {
+				errs <- err
+			}
+			if _, _, err := store.CreateAdjustment(ctx, id, aid, 10, effectiveAt); err != nil {
+				errs <- err
+			}
+		}(w)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("unexpected concurrent failure: %v", err)
+	}
+	view, err := store.GetView(ctx, id)
+	if err != nil {
+		t.Fatalf("view: %v", err)
+	}
+	if view.QuotaTotal != quota+workers*10 || len(view.Adjustments) != workers {
+		t.Fatalf("concurrent adjustments miscounted: %+v", view)
+	}
+	for _, a := range view.Adjustments {
+		if a.Status != StatusApplied {
+			t.Fatalf("adjustment left pending: %+v", a)
+		}
+	}
+}
+
+func TestAdjustmentSurvivesReconnection(t *testing.T) {
+	store := testStore(t)
+	from, to := activeWindow()
+	id := uniqueID(t)
+	mustCreate(t, store, id, 100, from, to)
+	ctx := context.Background()
+	effectiveAt := time.Now().Add(-time.Minute)
+	if _, _, err := store.CreateAdjustment(ctx, id, "adj-applied", 20, effectiveAt); err != nil {
+		t.Fatalf("increase: %v", err)
+	}
+	if _, _, err := store.CreateAdjustment(ctx, id, "adj-pending", 10, time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("future increase: %v", err)
+	}
+
+	// A fresh pool over the same database simulates a service restart.
+	pool, err := pgxpool.New(ctx, os.Getenv("TEST_DATABASE_URL"))
+	if err != nil {
+		t.Fatalf("reconnect: %v", err)
+	}
+	defer pool.Close()
+	restarted := NewStore(pool)
+	view, err := restarted.GetView(ctx, id)
+	if err != nil {
+		t.Fatalf("view after restart: %v", err)
+	}
+	if view.QuotaTotal != 120 || len(view.Adjustments) != 2 ||
+		view.Adjustments[0].Status != StatusApplied || view.Adjustments[1].Status != StatusPending {
+		t.Fatalf("adjustment state lost across restart: %+v", view)
+	}
+	// The applied adjustment is replayed, not re-applied.
+	replay, created, err := restarted.CreateAdjustment(ctx, id, "adj-applied", 20, effectiveAt)
+	if err != nil || created || replay.Status != StatusApplied {
+		t.Fatalf("adjustment replay after restart: %+v created=%v err=%v", replay, created, err)
+	}
+	view, _ = restarted.GetView(ctx, id)
+	if view.QuotaTotal != 120 {
+		t.Fatalf("restart replay counted the adjustment again: %+v", view)
+	}
+}
