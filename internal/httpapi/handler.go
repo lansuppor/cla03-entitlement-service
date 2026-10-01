@@ -15,6 +15,7 @@ type Service interface {
 	CreateEntitlement(ctx context.Context, in entitlements.CreateEntitlementInput) (entitlements.Entitlement, error)
 	CreateReservation(ctx context.Context, entitlementID, reservationID string, amount int64) (entitlements.Reservation, bool, error)
 	SettleReservation(ctx context.Context, entitlementID, reservationID, action string) (entitlements.Reservation, error)
+	ReverseReservation(ctx context.Context, entitlementID, reservationID, reversalID string) (entitlements.Reversal, bool, error)
 	GetView(ctx context.Context, entitlementID string) (entitlements.View, error)
 }
 
@@ -39,6 +40,7 @@ func New(checkDatabase func(context.Context) error, service Service) http.Handle
 	mux.HandleFunc("POST /entitlements/{entitlementID}/reservations", h.createReservation)
 	mux.HandleFunc("POST /entitlements/{entitlementID}/reservations/{reservationID}/confirm", h.settle(entitlements.ActionConfirm))
 	mux.HandleFunc("POST /entitlements/{entitlementID}/reservations/{reservationID}/release", h.settle(entitlements.ActionRelease))
+	mux.HandleFunc("POST /entitlements/{entitlementID}/reservations/{reservationID}/reverse", h.reverseReservation)
 	return mux
 }
 
@@ -124,6 +126,28 @@ func (h *handlers) settle(action string) http.HandlerFunc {
 	}
 }
 
+type reverseReservationRequest struct {
+	ReversalID string `json:"reversal_id"`
+}
+
+func (h *handlers) reverseReservation(w http.ResponseWriter, r *http.Request) {
+	var req reverseReservationRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	reversal, created, err := h.service.ReverseReservation(
+		r.Context(), r.PathValue("entitlementID"), r.PathValue("reservationID"), req.ReversalID)
+	if err != nil {
+		respondError(w, err)
+		return
+	}
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	respondJSON(w, status, reversal)
+}
+
 func (h *handlers) getEntitlement(w http.ResponseWriter, r *http.Request) {
 	view, err := h.service.GetView(r.Context(), r.PathValue("entitlementID"))
 	if err != nil {
@@ -158,6 +182,8 @@ var errorStatus = map[string]int{
 	entitlements.CodeReservationNotFound:     http.StatusNotFound,
 	entitlements.CodeReservationParamChanged: http.StatusConflict,
 	entitlements.CodeReservationSettled:      http.StatusConflict,
+	entitlements.CodeReservationNotConfirmed: http.StatusUnprocessableEntity,
+	entitlements.CodeReservationReversed:     http.StatusConflict,
 }
 
 func respondError(w http.ResponseWriter, err error) {

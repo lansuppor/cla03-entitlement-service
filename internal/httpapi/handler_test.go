@@ -47,12 +47,14 @@ func TestHealthAndReadiness(t *testing.T) {
 
 // fakeService records calls and returns scripted results.
 type fakeService struct {
-	entitlement entitlements.Entitlement
-	reservation entitlements.Reservation
-	created     bool
-	view        entitlements.View
-	err         error
+	entitlement  entitlements.Entitlement
+	reservation  entitlements.Reservation
+	reversal     entitlements.Reversal
+	created      bool
+	view         entitlements.View
+	err          error
 	settleAction string
+	reversalID   string
 }
 
 func (f *fakeService) CreateEntitlement(_ context.Context, _ entitlements.CreateEntitlementInput) (entitlements.Entitlement, error) {
@@ -66,6 +68,11 @@ func (f *fakeService) CreateReservation(_ context.Context, _, _ string, _ int64)
 func (f *fakeService) SettleReservation(_ context.Context, _, _, action string) (entitlements.Reservation, error) {
 	f.settleAction = action
 	return f.reservation, f.err
+}
+
+func (f *fakeService) ReverseReservation(_ context.Context, _, _, reversalID string) (entitlements.Reversal, bool, error) {
+	f.reversalID = reversalID
+	return f.reversal, f.created, f.err
 }
 
 func (f *fakeService) GetView(_ context.Context, _ string) (entitlements.View, error) {
@@ -115,6 +122,8 @@ func TestErrorMapping(t *testing.T) {
 		{"missing reservation", entitlements.CodeReservationNotFound, 404},
 		{"param mismatch", entitlements.CodeReservationParamChanged, 409},
 		{"already settled", entitlements.CodeReservationSettled, 409},
+		{"not confirmed", entitlements.CodeReservationNotConfirmed, 422},
+		{"already reversed", entitlements.CodeReservationReversed, 409},
 		{"internal", "unmapped", 500},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -144,6 +153,37 @@ func TestReservationReplayStatus(t *testing.T) {
 		"POST", "/entitlements/ent-1/reservations", `{"reservation_id":"r1","amount":5}`)
 	if replayed.Code != 200 {
 		t.Fatalf("replayed reservation: status=%d body=%q", replayed.Code, replayed.Body.String())
+	}
+}
+
+func TestReverseRoute(t *testing.T) {
+	reversal := entitlements.Reversal{ReversalID: "corr-1", ReservationID: "r1", Amount: 5, Status: "reversed", CreatedAt: time.Now()}
+	service := &fakeService{reversal: reversal, created: true}
+	created := serve(t, service, "POST", "/entitlements/ent-1/reservations/r1/reverse", `{"reversal_id":"corr-1"}`)
+	if created.Code != 201 || service.reversalID != "corr-1" {
+		t.Fatalf("new reversal: status=%d reversal_id=%q body=%q", created.Code, service.reversalID, created.Body.String())
+	}
+	if !strings.Contains(created.Body.String(), `"reversal_id":"corr-1"`) {
+		t.Fatalf("reversal body: %q", created.Body.String())
+	}
+	service.created = false
+	replayed := serve(t, service, "POST", "/entitlements/ent-1/reservations/r1/reverse", `{"reversal_id":"corr-1"}`)
+	if replayed.Code != 200 {
+		t.Fatalf("replayed reversal: status=%d body=%q", replayed.Code, replayed.Body.String())
+	}
+	// Unknown fields (a caller-supplied amount is not accepted) and malformed
+	// JSON are rejected before the domain is called.
+	for _, body := range []string{`{"reversal_id":"corr-1","amount":5}`, `{`} {
+		response := serve(t, service, "POST", "/entitlements/ent-1/reservations/r1/reverse", body)
+		if response.Code != 400 || !strings.Contains(response.Body.String(), `"invalid_request"`) {
+			t.Fatalf("body %q: status=%d body=%q", body, response.Code, response.Body.String())
+		}
+	}
+	// A missing reversal_id reaches the domain, which rejects it.
+	invalid := &fakeService{err: &entitlements.Error{Code: entitlements.CodeInvalidRequest, Message: "bad reversal_id"}}
+	response := serve(t, invalid, "POST", "/entitlements/ent-1/reservations/r1/reverse", `{}`)
+	if response.Code != 400 || !strings.Contains(response.Body.String(), `"invalid_request"`) {
+		t.Fatalf("missing reversal_id: status=%d body=%q", response.Code, response.Body.String())
 	}
 }
 

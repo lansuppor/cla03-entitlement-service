@@ -1,6 +1,7 @@
 // Package entitlements implements the seat-quota entitlement domain:
-// entitlement creation, idempotent reservations, and confirm/release
-// settlement, persisted in PostgreSQL.
+// entitlement creation, idempotent reservations, confirm/release
+// settlement, and corrective reversals of confirmed reservations,
+// persisted in PostgreSQL.
 package entitlements
 
 import (
@@ -26,6 +27,8 @@ const (
 	CodeReservationNotFound     = "reservation_not_found"
 	CodeReservationParamChanged = "reservation_param_mismatch"
 	CodeReservationSettled      = "reservation_already_settled"
+	CodeReservationNotConfirmed = "reservation_not_confirmed"
+	CodeReservationReversed     = "reservation_already_reversed"
 )
 
 // Error is a domain failure with a stable machine-readable code.
@@ -45,6 +48,7 @@ const (
 	StatusPending   = "pending"
 	StatusConfirmed = "confirmed"
 	StatusReleased  = "released"
+	StatusReversed  = "reversed"
 )
 
 // Settlement actions.
@@ -71,7 +75,23 @@ type Reservation struct {
 	CreatedAt     time.Time  `json:"created_at"`
 }
 
-// View is the per-entitlement quota and reservation report.
+// Reversal is a corrective record that refunds a confirmed reservation's
+// amount from used quota back to available quota. It is identified by the
+// caller-supplied correction identifier, unique within the entitlement, and
+// never alters the original reservation it refunds.
+type Reversal struct {
+	ReversalID    string     `json:"reversal_id"`
+	ReservationID string     `json:"reservation_id"`
+	Amount        int64      `json:"amount"`
+	Status        string     `json:"status"`
+	SettledAt     *time.Time `json:"settled_at,omitempty"`
+	CreatedAt     time.Time  `json:"created_at"`
+}
+
+// View is the per-entitlement quota and reservation report. Reservations
+// lists both reservations and corrective reversals; a reversal entry carries
+// its own correction identifier in ReservationID and status "reversed".
+// UsedAmount is confirmed quota minus effective reversals.
 type View struct {
 	EntitlementID   string        `json:"entitlement_id"`
 	SeatsTotal      int64         `json:"seats_total"`
@@ -124,7 +144,20 @@ CREATE TABLE IF NOT EXISTS reservations (
     settled_at     TIMESTAMPTZ,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (entitlement_id, reservation_id)
-);`)
+);
+CREATE TABLE IF NOT EXISTS reversals (
+    entitlement_id TEXT NOT NULL REFERENCES entitlements (entitlement_id),
+    reversal_id    TEXT NOT NULL,
+    reservation_id TEXT NOT NULL,
+    amount         BIGINT NOT NULL CHECK (amount > 0),
+    settled_at     TIMESTAMPTZ NOT NULL,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (entitlement_id, reversal_id),
+    UNIQUE (entitlement_id, reservation_id)
+);
+-- Databases initialized by an older schema may already have a reversals
+-- table without the settlement timestamp.
+ALTER TABLE reversals ADD COLUMN IF NOT EXISTS settled_at TIMESTAMPTZ;`)
 	if err != nil {
 		return fmt.Errorf("migrate schema: %w", err)
 	}
@@ -344,6 +377,103 @@ RETURNING reservation_id, amount, status, settled_at, created_at`,
 	return reservation, nil
 }
 
+// ReverseReservation refunds a confirmed reservation: it records a reversal
+// with the reservation's original amount and moves that amount from used
+// quota back to available quota. The caller-supplied reversalID identifies
+// the correction and is unique per entitlement: resubmitting it for the same
+// reservation returns the original reversal without refunding again
+// (created=false); resubmitting it for a different reservation fails without
+// changing state. The amount always comes from the confirmed reservation and
+// cannot be specified by the caller. A reservation can be reversed at most
+// once, and only while confirmed; the original reservation row is left
+// untouched. Reversal stays allowed after the entitlement expires.
+func (s *Store) ReverseReservation(ctx context.Context, entitlementID, reservationID, reversalID string) (Reversal, bool, error) {
+	if err := validIdentifier("reversal_id", reversalID); err != nil {
+		return Reversal{}, false, err
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Reversal{}, false, fmt.Errorf("begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := lockEntitlement(ctx, tx, entitlementID); err != nil {
+		return Reversal{}, false, err
+	}
+
+	var existing Reversal
+	err = tx.QueryRow(ctx, `
+SELECT reversal_id, reservation_id, amount, settled_at, created_at
+FROM reversals WHERE entitlement_id = $1 AND reversal_id = $2`,
+		entitlementID, reversalID).
+		Scan(&existing.ReversalID, &existing.ReservationID, &existing.Amount, &existing.SettledAt, &existing.CreatedAt)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return Reversal{}, false, fmt.Errorf("load reversal: %w", err)
+	}
+	if err == nil {
+		if existing.ReservationID != reservationID {
+			return Reversal{}, false, fail(CodeReservationParamChanged,
+				"reversal %q already targets reservation %q, not %q", reversalID, existing.ReservationID, reservationID)
+		}
+		existing.Status = StatusReversed
+		return existing, false, tx.Commit(ctx)
+	}
+
+	var reservation Reservation
+	err = tx.QueryRow(ctx, `
+SELECT reservation_id, amount, status, settled_at, created_at
+FROM reservations WHERE entitlement_id = $1 AND reservation_id = $2`,
+		entitlementID, reservationID).
+		Scan(&reservation.ReservationID, &reservation.Amount, &reservation.Status, &reservation.SettledAt, &reservation.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Reversal{}, false, fail(CodeReservationNotFound,
+			"reservation %q does not exist on entitlement %q", reservationID, entitlementID)
+	}
+	if err != nil {
+		return Reversal{}, false, fmt.Errorf("load reservation: %w", err)
+	}
+	if reservation.Status != StatusConfirmed {
+		return Reversal{}, false, fail(CodeReservationNotConfirmed,
+			"reservation %q is %s, only a confirmed reservation can be reversed", reservationID, reservation.Status)
+	}
+	var alreadyReversed bool
+	if err := tx.QueryRow(ctx, `
+SELECT EXISTS(SELECT 1 FROM reversals WHERE entitlement_id = $1 AND reservation_id = $2)`,
+		entitlementID, reservationID).Scan(&alreadyReversed); err != nil {
+		return Reversal{}, false, fmt.Errorf("check existing reversal: %w", err)
+	}
+	if alreadyReversed {
+		return Reversal{}, false, fail(CodeReservationReversed,
+			"reservation %q has already been reversed", reservationID)
+	}
+
+	var created Reversal
+	err = tx.QueryRow(ctx, `
+INSERT INTO reversals (entitlement_id, reversal_id, reservation_id, amount, settled_at)
+VALUES ($1, $2, $3, $4, now())
+RETURNING reversal_id, reservation_id, amount, settled_at, created_at`,
+		entitlementID, reversalID, reservationID, reservation.Amount).
+		Scan(&created.ReversalID, &created.ReservationID, &created.Amount, &created.SettledAt, &created.CreatedAt)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return Reversal{}, false, fail(CodeReservationReversed,
+				"reservation %q has already been reversed", reservationID)
+		}
+		return Reversal{}, false, fmt.Errorf("insert reversal: %w", err)
+	}
+	created.Status = StatusReversed
+	if _, err := tx.Exec(ctx, `
+UPDATE entitlements SET used_amount = used_amount - $1 WHERE entitlement_id = $2`,
+		created.Amount, entitlementID); err != nil {
+		return Reversal{}, false, fmt.Errorf("refund quota: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Reversal{}, false, fmt.Errorf("commit reversal: %w", err)
+	}
+	return created, true, nil
+}
+
 // GetView returns the quota breakdown and reservation list for an
 // entitlement, consistent with the committed state.
 func (s *Store) GetView(ctx context.Context, entitlementID string) (View, error) {
@@ -382,7 +512,13 @@ FROM entitlements WHERE entitlement_id = $1`, entitlementID).
 
 	rows, err := tx.Query(ctx, `
 SELECT reservation_id, amount, status, settled_at, created_at
-FROM reservations WHERE entitlement_id = $1
+FROM (
+    SELECT reservation_id, amount, status, settled_at, created_at
+    FROM reservations WHERE entitlement_id = $1
+    UNION ALL
+    SELECT reversal_id, amount, 'reversed', settled_at, created_at
+    FROM reversals WHERE entitlement_id = $1
+) AS entries
 ORDER BY created_at, reservation_id`, entitlementID)
 	if err != nil {
 		return View{}, fmt.Errorf("list reservations: %w", err)

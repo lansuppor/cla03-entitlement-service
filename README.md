@@ -1,6 +1,6 @@
 # Entitlement service
 
-Go HTTP service for team service entitlements: seat-quota grants with idempotent reservations and confirm/release settlement, persisted in PostgreSQL. Requires Go 1.27.1 and PostgreSQL 18.6.
+Go HTTP service for team service entitlements: seat-quota grants with idempotent reservations, confirm/release settlement, and corrective reversals of confirmed reservations, persisted in PostgreSQL. Requires Go 1.27.1 and PostgreSQL 18.6.
 
 ```sh
 go mod download
@@ -52,6 +52,20 @@ All requests and responses are JSON. Failures return `{"error":{"code":"...","me
 
 `POST /entitlements/{entitlement_id}/reservations/{reservation_id}/confirm` moves the held amount to used quota. `POST .../release` returns it to available quota. Both return 200 with the settled reservation. A reservation settles exactly once: any further confirm or release fails with 409 `reservation_already_settled` without affecting committed data. Settlement stays allowed after the entitlement expires.
 
+### Reverse a confirmed reservation
+
+`POST /entitlements/{entitlement_id}/reservations/{reservation_id}/reverse`
+
+```json
+{"reversal_id":"corr-2026-0001"}
+```
+
+When operations discovers a confirmed reservation was recorded by mistake, a reversal corrects it: the service records a reversal entry with the reservation's original amount and moves that amount from used quota back to available quota. The amount always comes from the confirmed reservation; the caller must not send one (an `amount` field is rejected with 400 `invalid_request`).
+
+`reversal_id` is the caller-supplied correction identifier, unique within the entitlement. The first submission returns 201 with the reversal. Resubmitting the same identifier for the same reservation returns 200 with the original reversal and does not refund again; resubmitting it for a different reservation fails with 409 `reservation_param_mismatch` and changes nothing. A reservation can be reversed at most once: a further reversal under a new identifier fails with 409 `reservation_already_reversed`. Only confirmed reservations can be reversed — pending or released ones fail with 422 `reservation_not_confirmed`; an unknown reservation fails with 404 `reservation_not_found`. Reversal stays allowed after the entitlement expires, matching settlement.
+
+The reversal response and the entitlement's reservation list both describe the reversal with its own identifier, amount, status `reversed`, and creation and settlement timestamps; the original reservation and its confirmation record stay untouched and remain visible alongside it.
+
 ### Query an entitlement
 
 `GET /entitlements/{entitlement_id}` returns 200 with the quota breakdown and reservation list:
@@ -61,19 +75,20 @@ All requests and responses are JSON. Failures return `{"error":{"code":"...","me
   "entitlement_id": "team-alpha",
   "seats_total": 100,
   "quota_total": 100,
-  "used_amount": 30,
+  "used_amount": 0,
   "reserved_amount": 0,
-  "available_amount": 70,
+  "available_amount": 100,
   "status": "active",
   "valid_from": "2026-01-01T00:00:00Z",
   "valid_to": "2027-01-01T00:00:00Z",
   "reservations": [
-    {"reservation_id": "sub-a-001", "amount": 30, "status": "confirmed", "settled_at": "...", "created_at": "..."}
+    {"reservation_id": "sub-a-001", "amount": 30, "status": "confirmed", "settled_at": "...", "created_at": "..."},
+    {"reservation_id": "corr-2026-0001", "amount": 30, "status": "reversed", "settled_at": "...", "created_at": "..."}
   ]
 }
 ```
 
-`status` is `pending`, `active` or `expired` relative to the validity window. Each reservation reports its business identifier, amount, lifecycle status (`pending`, `confirmed`, `released`) and settlement timestamp.
+`status` is `pending`, `active` or `expired` relative to the validity window. Each entry reports its business identifier, amount, lifecycle status (`pending`, `confirmed`, `released` for reservations; `reversed` for corrective reversals) and settlement timestamp. `used_amount` is confirmed quota minus effective reversals, so a reversed reservation leaves the original confirmation and the reversal both visible while the quota figures reflect only the net effect.
 
 ### Error codes
 
@@ -87,9 +102,31 @@ All requests and responses are JSON. Failures return `{"error":{"code":"...","me
 | `reservation_not_found` | 404 | Unknown reservation |
 | `reservation_param_mismatch` | 409 | Business identifier reused with different parameters |
 | `reservation_already_settled` | 409 | Reservation was already confirmed or released |
+| `reservation_not_confirmed` | 422 | Reservation is not confirmed, so it cannot be reversed |
+| `reservation_already_reversed` | 409 | Reservation was already reversed |
 
 ## Consistency
 
-Concurrent reservations, confirmations and releases on the same entitlement are serialized with a row lock in PostgreSQL, so used quota plus unsettled reservations never exceeds the total quota, and failed requests leave no partial results. All state lives in PostgreSQL, so a restart preserves every quota figure and reservation status.
+Concurrent reservations, confirmations, releases and reversals on the same entitlement are serialized with a row lock in PostgreSQL, so used quota plus unsettled reservations never exceeds the total quota, repeated requests never grant or refund quota twice, and failed requests leave no partial results. All state lives in PostgreSQL, so a restart preserves every quota figure, reservation status and reversal record.
 
 The local setup uses a trusted loopback connection and C collation without ICU. Use separate database directories, database ports and HTTP ports when running multiple copies.
+
+## Verifying the reversal flow
+
+With the server running as above, the full correction cycle can be exercised with curl:
+
+```sh
+# Create an entitlement and confirm a reservation of 30 seats.
+curl -s -X POST 127.0.0.1:8080/entitlements -d '{"entitlement_id":"team-alpha","quota_total":100,"valid_from":"2026-01-01T00:00:00Z","valid_to":"2027-01-01T00:00:00Z"}'
+curl -s -X POST 127.0.0.1:8080/entitlements/team-alpha/reservations -d '{"reservation_id":"sub-a-001","amount":30}'
+curl -s -X POST 127.0.0.1:8080/entitlements/team-alpha/reservations/sub-a-001/confirm
+
+# Reverse it: used_amount drops back to 0 and both records stay listed.
+curl -s -X POST 127.0.0.1:8080/entitlements/team-alpha/reservations/sub-a-001/reverse -d '{"reversal_id":"corr-2026-0001"}'
+curl -s 127.0.0.1:8080/entitlements/team-alpha
+
+# Replays and illegal corrections are safe no-ops with stable error codes.
+curl -s -X POST 127.0.0.1:8080/entitlements/team-alpha/reservations/sub-a-001/reverse -d '{"reversal_id":"corr-2026-0001"}'   # 200, original reversal
+curl -s -X POST 127.0.0.1:8080/entitlements/team-alpha/reservations/sub-a-001/reverse -d '{"reversal_id":"corr-2026-0002"}'   # 409 reservation_already_reversed
+curl -s -X POST 127.0.0.1:8080/entitlements/team-alpha/reservations/sub-a-404/reverse -d '{"reversal_id":"corr-2026-0003"}'   # 404 reservation_not_found
+```
