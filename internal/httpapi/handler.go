@@ -19,6 +19,8 @@ type Service interface {
 	CreateAdjustment(ctx context.Context, entitlementID, adjustmentID string, delta int64, effectiveAt time.Time) (entitlements.Adjustment, bool, error)
 	RescheduleEntitlement(ctx context.Context, entitlementID, rescheduleID string, newValidFrom, newValidTo time.Time) (entitlements.Reschedule, bool, error)
 	CreateSeatAdjustment(ctx context.Context, entitlementID, seatAdjustmentID string, delta int64) (entitlements.SeatAdjustment, bool, error)
+	PauseEntitlement(ctx context.Context, entitlementID, eventID string, at time.Time) (entitlements.PauseResumeEvent, bool, error)
+	ResumeEntitlement(ctx context.Context, entitlementID, eventID string, at time.Time) (entitlements.PauseResumeEvent, bool, error)
 	GetView(ctx context.Context, entitlementID string) (entitlements.View, error)
 }
 
@@ -47,6 +49,8 @@ func New(checkDatabase func(context.Context) error, service Service) http.Handle
 	mux.HandleFunc("POST /entitlements/{entitlementID}/adjustments", h.createAdjustment)
 	mux.HandleFunc("POST /entitlements/{entitlementID}/reschedules", h.createReschedule)
 	mux.HandleFunc("POST /entitlements/{entitlementID}/seat-adjustments", h.createSeatAdjustment)
+	mux.HandleFunc("POST /entitlements/{entitlementID}/pauses", h.pauseEntitlement)
+	mux.HandleFunc("POST /entitlements/{entitlementID}/resumes", h.resumeEntitlement)
 	return mux
 }
 
@@ -273,6 +277,68 @@ func (h *handlers) getEntitlement(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, http.StatusOK, view)
 }
 
+type pauseEntitlementRequest struct {
+	PauseID  string `json:"pause_id"`
+	PausedAt string `json:"paused_at"`
+}
+
+type resumeEntitlementRequest struct {
+	ResumeID  string `json:"resume_id"`
+	ResumedAt string `json:"resumed_at"`
+}
+
+func (h *handlers) pauseEntitlement(w http.ResponseWriter, r *http.Request) {
+	var req pauseEntitlementRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	at, err := time.Parse(time.RFC3339, req.PausedAt)
+	if req.PausedAt == "" || err != nil {
+		respondError(w, &entitlements.Error{
+			Code:    entitlements.CodeInvalidRequest,
+			Message: "paused_at must be an RFC 3339 timestamp, e.g. 2026-06-01T00:00:00Z",
+		})
+		return
+	}
+	event, created, err := h.service.PauseEntitlement(
+		r.Context(), r.PathValue("entitlementID"), req.PauseID, at)
+	if err != nil {
+		respondError(w, err)
+		return
+	}
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	respondJSON(w, status, event)
+}
+
+func (h *handlers) resumeEntitlement(w http.ResponseWriter, r *http.Request) {
+	var req resumeEntitlementRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	at, err := time.Parse(time.RFC3339, req.ResumedAt)
+	if req.ResumedAt == "" || err != nil {
+		respondError(w, &entitlements.Error{
+			Code:    entitlements.CodeInvalidRequest,
+			Message: "resumed_at must be an RFC 3339 timestamp, e.g. 2026-06-01T00:00:00Z",
+		})
+		return
+	}
+	event, created, err := h.service.ResumeEntitlement(
+		r.Context(), r.PathValue("entitlementID"), req.ResumeID, at)
+	if err != nil {
+		respondError(w, err)
+		return
+	}
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	respondJSON(w, status, event)
+}
+
 // decode parses a JSON request body strictly; on failure it writes the error
 // response and returns false.
 func decode(w http.ResponseWriter, r *http.Request, target any) bool {
@@ -290,19 +356,24 @@ func decode(w http.ResponseWriter, r *http.Request, target any) bool {
 
 // errorStatus maps stable domain error codes to HTTP statuses.
 var errorStatus = map[string]int{
-	entitlements.CodeInvalidRequest:          http.StatusBadRequest,
-	entitlements.CodeEntitlementExists:       http.StatusConflict,
-	entitlements.CodeEntitlementNotFound:     http.StatusNotFound,
-	entitlements.CodeEntitlementNotActive:    http.StatusUnprocessableEntity,
-	entitlements.CodeInsufficientQuota:       http.StatusUnprocessableEntity,
-	entitlements.CodeReservationNotFound:     http.StatusNotFound,
-	entitlements.CodeReservationParamChanged: http.StatusConflict,
-	entitlements.CodeReservationSettled:      http.StatusConflict,
-	entitlements.CodeReservationNotConfirmed: http.StatusUnprocessableEntity,
-	entitlements.CodeReservationReversed:     http.StatusConflict,
-	entitlements.CodeAdjustmentParamChanged:  http.StatusConflict,
-	entitlements.CodeRescheduleParamChanged:  http.StatusConflict,
-	entitlements.CodeSeatAdjustmentChanged:   http.StatusConflict,
+	entitlements.CodeInvalidRequest:           http.StatusBadRequest,
+	entitlements.CodeEntitlementExists:        http.StatusConflict,
+	entitlements.CodeEntitlementNotFound:      http.StatusNotFound,
+	entitlements.CodeEntitlementNotActive:     http.StatusUnprocessableEntity,
+	entitlements.CodeInsufficientQuota:        http.StatusUnprocessableEntity,
+	entitlements.CodeReservationNotFound:      http.StatusNotFound,
+	entitlements.CodeReservationParamChanged:  http.StatusConflict,
+	entitlements.CodeReservationSettled:       http.StatusConflict,
+	entitlements.CodeReservationNotConfirmed:  http.StatusUnprocessableEntity,
+	entitlements.CodeReservationReversed:      http.StatusConflict,
+	entitlements.CodeAdjustmentParamChanged:   http.StatusConflict,
+	entitlements.CodeRescheduleParamChanged:   http.StatusConflict,
+	entitlements.CodeSeatAdjustmentChanged:    http.StatusConflict,
+	entitlements.CodeEntitlementClosed:        http.StatusConflict,
+	entitlements.CodePauseResumeParamChanged:  http.StatusConflict,
+	entitlements.CodeEntitlementAlreadyPaused: http.StatusConflict,
+	entitlements.CodeEntitlementNotPaused:     http.StatusConflict,
+	entitlements.CodeEntitlementPaused:        http.StatusUnprocessableEntity,
 }
 
 func respondError(w http.ResponseWriter, err error) {

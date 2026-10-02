@@ -176,7 +176,9 @@ func TestValidityWindow(t *testing.T) {
 	expiredID := uniqueID(t)
 	mustCreate(t, store, expiredID, 10, now.Add(-2*time.Hour), now.Add(-time.Hour))
 	_, _, err = store.CreateReservation(ctx, expiredID, "res-1", "dept-1", 1)
-	wantCode(t, err, CodeEntitlementNotActive)
+	// The first write after expiry closes the entitlement, so the new grant is
+	// refused as closed rather than merely inactive.
+	wantCode(t, err, CodeEntitlementClosed)
 
 	// A reservation made while active can still settle after expiry.
 	liveID := uniqueID(t)
@@ -188,13 +190,13 @@ func TestValidityWindow(t *testing.T) {
 		t.Fatalf("expire entitlement: %v", err)
 	}
 	_, _, err = store.CreateReservation(ctx, liveID, "res-2", "dept-1", 1)
-	wantCode(t, err, CodeEntitlementNotActive)
+	wantCode(t, err, CodeEntitlementClosed)
 	settled, err := store.SettleReservation(ctx, liveID, "res-1", ActionConfirm)
 	if err != nil || settled.Status != StatusConfirmed {
 		t.Fatalf("confirm after expiry: %+v err=%v", settled, err)
 	}
 	view, _ := store.GetView(ctx, liveID)
-	if view.Status != "expired" || view.UsedAmount != 5 {
+	if view.Status != StatusClosed || view.UsedAmount != 5 || view.ClosedAt == nil {
 		t.Fatalf("view after expiry: %+v", view)
 	}
 }
@@ -430,15 +432,16 @@ func TestReverseAfterExpiry(t *testing.T) {
 	if _, err := store.pool.Exec(ctx, `UPDATE entitlements SET valid_to = now() - interval '1 minute' WHERE entitlement_id = $1`, id); err != nil {
 		t.Fatalf("expire entitlement: %v", err)
 	}
-	// New reservations are still rejected, but reversal stays allowed.
+	// New reservations are rejected and the touch closes the entitlement,
+	// but reversal of the confirmed hold stays allowed.
 	_, _, err := store.CreateReservation(ctx, id, "res-2", "dept-1", 1)
-	wantCode(t, err, CodeEntitlementNotActive)
+	wantCode(t, err, CodeEntitlementClosed)
 	reversal, created, err := store.ReverseReservation(ctx, id, "res-1", "corr-1")
 	if err != nil || !created || reversal.Amount != 20 {
 		t.Fatalf("reverse after expiry: %+v created=%v err=%v", reversal, created, err)
 	}
 	view, _ := store.GetView(ctx, id)
-	if view.Status != "expired" || view.UsedAmount != 0 || view.AvailableAmount != 50 {
+	if view.Status != StatusClosed || view.UsedAmount != 0 || view.AvailableAmount != 50 {
 		t.Fatalf("view after expiry reversal: %+v", view)
 	}
 }
@@ -949,7 +952,7 @@ func TestRescheduleIdempotency(t *testing.T) {
 	}
 
 	// The same identifier with a different window fails and changes nothing.
-	_, _, err = store.RescheduleEntitlement(ctx, id, "move-1", newFrom.Add(time.Hour), newTo)
+	_, _, err = store.RescheduleEntitlement(ctx, id, "move-1", newFrom.Add(-time.Hour), newTo)
 	wantCode(t, err, CodeRescheduleParamChanged)
 	_, _, err = store.RescheduleEntitlement(ctx, id, "move-1", newFrom, newTo.Add(time.Hour))
 	wantCode(t, err, CodeRescheduleParamChanged)
@@ -991,15 +994,18 @@ func TestRescheduleChangesActiveStateNotQuota(t *testing.T) {
 		t.Fatalf("state after entering window: %+v", view)
 	}
 
-	// Reschedule the end to before now: new reservations are rejected, but
-	// the unsettled hold still settles and the confirmed one still reverses.
+	// Reschedule the end to before now: the reschedule is allowed because the
+	// entitlement is still active when submitted; it rewrites the window but
+	// moves no quota figure.
 	expireFrom := now.Add(-2 * time.Hour).UTC().Truncate(time.Microsecond)
 	expireTo := now.Add(-time.Minute).UTC().Truncate(time.Microsecond)
 	if _, _, err := store.RescheduleEntitlement(ctx, id, "move-expire", expireFrom, expireTo); err != nil {
 		t.Fatalf("reschedule into expiry: %v", err)
 	}
+	// The next touch performs the one-time closure and refuses the new grant;
+	// the unsettled hold still settles and the confirmed one still reverses.
 	_, _, err := store.CreateReservation(ctx, id, "res-3", "dept-1", 1)
-	wantCode(t, err, CodeEntitlementNotActive)
+	wantCode(t, err, CodeEntitlementClosed)
 	if _, err := store.SettleReservation(ctx, id, "res-2", ActionRelease); err != nil {
 		t.Fatalf("release after new expiry: %v", err)
 	}
@@ -1007,7 +1013,7 @@ func TestRescheduleChangesActiveStateNotQuota(t *testing.T) {
 		t.Fatalf("reverse after new expiry: %v", err)
 	}
 	view, _ = store.GetView(ctx, id)
-	if view.Status != "expired" || !view.ValidTo.Equal(expireTo) {
+	if view.Status != StatusClosed || !view.ValidTo.Equal(expireTo) || view.ClosedAt == nil {
 		t.Fatalf("status after new expiry: %+v", view)
 	}
 	// No quota figure moved because of the reschedules themselves.
@@ -1019,18 +1025,17 @@ func TestRescheduleChangesActiveStateNotQuota(t *testing.T) {
 		t.Fatalf("reschedule list should keep both records: %+v", view.Reschedules)
 	}
 
-	// Pulling the window back open makes new reservations possible again.
+	// Closure is one-way: pulling the window back open is refused even though
+	// the new window covers the current time, and no new grant is accepted.
 	reopenFrom := now.Add(-time.Hour).UTC().Truncate(time.Microsecond)
 	reopenTo := now.Add(time.Hour).UTC().Truncate(time.Microsecond)
-	if _, _, err := store.RescheduleEntitlement(ctx, id, "move-reopen", reopenFrom, reopenTo); err != nil {
-		t.Fatalf("reschedule reopen: %v", err)
-	}
-	if _, _, err := store.CreateReservation(ctx, id, "res-4", "dept-1", 10); err != nil {
-		t.Fatalf("reserve after reopening window: %v", err)
-	}
+	_, _, err = store.RescheduleEntitlement(ctx, id, "move-reopen", reopenFrom, reopenTo)
+	wantCode(t, err, CodeEntitlementClosed)
+	_, _, err = store.CreateReservation(ctx, id, "res-4", "dept-1", 10)
+	wantCode(t, err, CodeEntitlementClosed)
 	view, _ = store.GetView(ctx, id)
-	if view.Status != "active" || view.ReservedAmount != 10 || view.AvailableAmount != 90 {
-		t.Fatalf("state after reopening: %+v", view)
+	if view.Status != StatusClosed || !view.ValidTo.Equal(expireTo) || len(view.Reschedules) != 2 {
+		t.Fatalf("closed entitlement reopened: %+v", view)
 	}
 }
 
@@ -1121,10 +1126,12 @@ func TestReschedulesOrderedInView(t *testing.T) {
 			t.Fatalf("reschedule entry %d: %+v", i, view.Reschedules[i])
 		}
 	}
-	// The view's window reflects the latest reschedule.
+	// The view's window reflects the latest reschedule; its past end also
+	// triggers the one-time closure on this read.
 	last := view.Reschedules[2]
-	if !view.ValidFrom.Equal(last.NewValidFrom) || !view.ValidTo.Equal(last.NewValidTo) || view.Status != "expired" {
-		t.Fatalf("view window should reflect latest reschedule: %+v", view)
+	if !view.ValidFrom.Equal(last.NewValidFrom) || !view.ValidTo.Equal(last.NewValidTo) ||
+		view.Status != StatusClosed || view.ClosedAt == nil {
+		t.Fatalf("view window should reflect latest reschedule and be closed: %+v", view)
 	}
 }
 
@@ -1202,17 +1209,22 @@ func TestReschedulesSurviveReconnection(t *testing.T) {
 		t.Fatalf("view after restart: %v", err)
 	}
 	if !view.ValidFrom.Equal(newFrom) || !view.ValidTo.Equal(newTo) ||
-		view.Status != "expired" || len(view.Reschedules) != 1 {
-		t.Fatalf("rescheduled window lost across restart: %+v", view)
+		view.Status != StatusClosed || view.ClosedAt == nil || len(view.Reschedules) != 1 {
+		t.Fatalf("rescheduled window/closure lost across restart: %+v", view)
 	}
-	// The reschedule identifier is still replayed, not re-applied.
+	// The reschedule identifier is still replayed, not re-applied, even now
+	// that the entitlement is closed.
 	replay, created, err := restarted.RescheduleEntitlement(ctx, id, "move-1", newFrom, newTo)
 	if err != nil || created || !replay.NewValidFrom.Equal(newFrom) {
 		t.Fatalf("reschedule replay after restart: %+v created=%v err=%v", replay, created, err)
 	}
-	// New reservations stay blocked by the persisted, already-expired window.
+	// New grants stay blocked; closure persisted across the restart and is
+	// one-way, so reopening is refused too.
 	_, _, err = restarted.CreateReservation(ctx, id, "res-1", "dept-1", 1)
-	wantCode(t, err, CodeEntitlementNotActive)
+	wantCode(t, err, CodeEntitlementClosed)
+	_, _, err = restarted.RescheduleEntitlement(ctx, id, "move-reopen",
+		time.Now().Add(-time.Hour), time.Now().Add(time.Hour))
+	wantCode(t, err, CodeEntitlementClosed)
 }
 
 func createSeatEntitlement(t *testing.T, store *Store, seats, quota int64) string {
@@ -1605,4 +1617,519 @@ func TestSeatAdjustmentsSurviveReconnection(t *testing.T) {
 	}
 	_, _, err = restarted.CreateSeatAdjustment(ctx, id, "seat-crowd", -101)
 	wantCode(t, err, CodeInsufficientQuota)
+}
+
+func expireEntitlement(t *testing.T, store *Store, id string) {
+	t.Helper()
+	if _, err := store.pool.Exec(context.Background(),
+		`UPDATE entitlements SET valid_to = now() - interval '1 minute' WHERE entitlement_id = $1`, id); err != nil {
+		t.Fatalf("expire entitlement: %v", err)
+	}
+}
+
+func TestClosureWritesSnapshotExactlyOnce(t *testing.T) {
+	store := testStore(t)
+	from, to := activeWindow()
+	id := uniqueID(t)
+	mustCreate(t, store, id, 100, from, to)
+	ctx := context.Background()
+
+	// 20 confirmed (used), 30 still held (reserved), 50 available.
+	if _, _, err := store.CreateReservation(ctx, id, "res-used", "dept-a", 20); err != nil {
+		t.Fatalf("reserve used: %v", err)
+	}
+	if _, err := store.SettleReservation(ctx, id, "res-used", ActionConfirm); err != nil {
+		t.Fatalf("confirm: %v", err)
+	}
+	if _, _, err := store.CreateReservation(ctx, id, "res-held", "dept-b", 30); err != nil {
+		t.Fatalf("reserve held: %v", err)
+	}
+	expireEntitlement(t, store, id)
+
+	// The first view after expiry performs the one-time closure inside the
+	// read transaction.
+	view, err := store.GetView(ctx, id)
+	if err != nil {
+		t.Fatalf("view: %v", err)
+	}
+	if view.Status != StatusClosed || view.ClosedAt == nil || view.ClosureSnapshot == nil {
+		t.Fatalf("entitlement not closed: %+v", view)
+	}
+	snap := view.ClosureSnapshot
+	if snap.EntitlementID != id || snap.SeatsTotal != 100 || snap.QuotaTotal != 100 ||
+		snap.UsedAmount != 20 || snap.ReservedAmount != 30 || snap.AvailableAmount != 50 {
+		t.Fatalf("snapshot figures do not match close-time state: %+v", snap)
+	}
+	if !snap.ValidFrom.Equal(view.ValidFrom) || !snap.ValidTo.Equal(view.ValidTo) ||
+		!snap.ClosedAt.Equal(*view.ClosedAt) || snap.ClosedAt.IsZero() {
+		t.Fatalf("snapshot window/close time: %+v view window %s..%s",
+			snap, view.ValidFrom, view.ValidTo)
+	}
+	firstClosedAt := *view.ClosedAt
+
+	// Repeated touches neither add a second close record nor move the time.
+	view2, _ := store.GetView(ctx, id)
+	if view2.ClosedAt == nil || !view2.ClosedAt.Equal(firstClosedAt) || view2.Status != StatusClosed {
+		t.Fatalf("closure not stable across views: %+v", view2)
+	}
+	var snapshotCount int
+	if err := store.pool.QueryRow(ctx,
+		`SELECT count(*) FROM closure_snapshots WHERE entitlement_id = $1`, id).Scan(&snapshotCount); err != nil {
+		t.Fatalf("count snapshots: %v", err)
+	}
+	if snapshotCount != 1 {
+		t.Fatalf("want exactly one closure snapshot, got %d", snapshotCount)
+	}
+
+	// Settling the in-flight hold after closure changes the live figures but
+	// the accounting snapshot keeps the close-instant numbers.
+	if _, err := store.SettleReservation(ctx, id, "res-held", ActionRelease); err != nil {
+		t.Fatalf("release after closure: %v", err)
+	}
+	view3, _ := store.GetView(ctx, id)
+	if view3.ReservedAmount != 0 || view3.AvailableAmount != 80 {
+		t.Fatalf("live figures after release: %+v", view3)
+	}
+	if view3.ClosureSnapshot.ReservedAmount != 30 || view3.ClosureSnapshot.AvailableAmount != 50 {
+		t.Fatalf("snapshot mutated after close: %+v", view3.ClosureSnapshot)
+	}
+}
+
+func TestClosureTriggeredByWritesAndBlocksChanges(t *testing.T) {
+	store := testStore(t)
+	from, to := activeWindow()
+	id := uniqueID(t)
+	mustCreate(t, store, id, 100, from, to)
+	ctx := context.Background()
+	if _, _, err := store.CreateReservation(ctx, id, "res-1", "dept-a", 20); err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	adjAt := time.Now().Add(-time.Minute).UTC().Truncate(time.Microsecond)
+	if _, _, err := store.CreateAdjustment(ctx, id, "adj-1", 10, adjAt); err != nil {
+		t.Fatalf("adjustment: %v", err)
+	}
+	if _, _, err := store.CreateSeatAdjustment(ctx, id, "seat-1", 10); err != nil {
+		t.Fatalf("seat adjustment: %v", err)
+	}
+	newFrom := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Microsecond)
+	newTo := time.Now().Add(time.Hour).UTC().Truncate(time.Microsecond)
+	if _, _, err := store.RescheduleEntitlement(ctx, id, "move-1", newFrom, newTo); err != nil {
+		t.Fatalf("reschedule: %v", err)
+	}
+	if _, err := store.SettleReservation(ctx, id, "res-1", ActionConfirm); err != nil {
+		t.Fatalf("confirm: %v", err)
+	}
+	// A second, still-pending hold exists when the entitlement closes.
+	if _, _, err := store.CreateReservation(ctx, id, "res-2", "dept-a", 5); err != nil {
+		t.Fatalf("reserve in-flight: %v", err)
+	}
+	expireEntitlement(t, store, id)
+
+	// A write itself triggers closure: an existing adjustment replay closes
+	// the entitlement and still returns its original record.
+	replay, created, err := store.CreateAdjustment(ctx, id, "adj-1", 10, adjAt)
+	if err != nil || created || replay.Status != StatusApplied {
+		t.Fatalf("replay after expiry should close and return original: %+v created=%v err=%v", replay, created, err)
+	}
+	view, _ := store.GetView(ctx, id)
+	if view.Status != StatusClosed || view.ClosedAt == nil {
+		t.Fatalf("write did not close entitlement: %+v", view)
+	}
+
+	// Every change type closure stops now fails as a whole and writes nothing.
+	_, _, err = store.CreateReservation(ctx, id, "res-new", "dept-a", 1)
+	wantCode(t, err, CodeEntitlementClosed)
+	_, _, err = store.CreateAdjustment(ctx, id, "adj-new", 1, time.Now().Add(-time.Minute))
+	wantCode(t, err, CodeEntitlementClosed)
+	_, _, err = store.CreateSeatAdjustment(ctx, id, "seat-new", 1)
+	wantCode(t, err, CodeEntitlementClosed)
+	_, _, err = store.RescheduleEntitlement(ctx, id, "move-new",
+		time.Now().Add(-time.Hour), time.Now().Add(2*time.Hour))
+	wantCode(t, err, CodeEntitlementClosed)
+
+	// In-flight settlement and corrective reversal still go through.
+	released, err := store.SettleReservation(ctx, id, "res-2", ActionRelease)
+	if err != nil || released.Status != StatusReleased {
+		t.Fatalf("release on closed entitlement: %+v err=%v", released, err)
+	}
+	if _, _, err := store.ReverseReservation(ctx, id, "res-1", "corr-1"); err != nil {
+		t.Fatalf("reverse on closed entitlement: %v", err)
+	}
+
+	// Failed change requests left no records or figure movement, and the
+	// idempotent replays of pre-close records still return their originals.
+	after, _ := store.GetView(ctx, id)
+	if len(after.Adjustments) != 1 || len(after.SeatAdjustments) != 1 ||
+		len(after.Reschedules) != 1 || after.QuotaTotal != 110 || after.SeatsTotal != 110 {
+		t.Fatalf("closed entitlement accepted a change: %+v", after)
+	}
+	if _, created, err := store.CreateSeatAdjustment(ctx, id, "seat-1", 10); err != nil || created {
+		t.Fatalf("seat replay after close created=%v err=%v", created, err)
+	}
+	if _, created, err := store.RescheduleEntitlement(ctx, id, "move-1", newFrom, newTo); err != nil || created {
+		t.Fatalf("reschedule replay after close created=%v err=%v", created, err)
+	}
+}
+
+func TestClosureIsOneWayAcrossReschedule(t *testing.T) {
+	store := testStore(t)
+	from, to := activeWindow()
+	id := uniqueID(t)
+	mustCreate(t, store, id, 100, from, to)
+	ctx := context.Background()
+	expireEntitlement(t, store, id)
+
+	// The view closes it once.
+	view, _ := store.GetView(ctx, id)
+	if view.Status != StatusClosed {
+		t.Fatalf("not closed: %+v", view)
+	}
+	// Even a window covering the current time cannot reopen a closed grant.
+	_, _, err := store.RescheduleEntitlement(ctx, id, "move-reopen",
+		time.Now().Add(-time.Hour), time.Now().Add(time.Hour))
+	wantCode(t, err, CodeEntitlementClosed)
+	view, _ = store.GetView(ctx, id)
+	if view.Status != StatusClosed || view.ClosedAt == nil {
+		t.Fatalf("closed entitlement reopened: %+v", view)
+	}
+	_, _, err = store.CreateReservation(ctx, id, "res-1", "dept-a", 1)
+	wantCode(t, err, CodeEntitlementClosed)
+}
+
+func TestClosureFoldsDueAdjustmentsIntoSnapshot(t *testing.T) {
+	store := testStore(t)
+	from, to := activeWindow()
+	id := uniqueID(t)
+	mustCreate(t, store, id, 100, from, to)
+	ctx := context.Background()
+	// A pending increase comes due during the downtime before the next touch.
+	dueAt := time.Now().Add(1200 * time.Millisecond)
+	if _, _, err := store.CreateAdjustment(ctx, id, "adj-later", 50, dueAt); err != nil {
+		t.Fatalf("create pending adjustment: %v", err)
+	}
+	expireEntitlement(t, store, id)
+	time.Sleep(1500 * time.Millisecond)
+	view, err := store.GetView(ctx, id)
+	if err != nil {
+		t.Fatalf("view: %v", err)
+	}
+	if view.Status != StatusClosed || view.QuotaTotal != 150 {
+		t.Fatalf("closure did not fold the due adjustment: %+v", view)
+	}
+	if view.ClosureSnapshot.QuotaTotal != 150 || view.ClosureSnapshot.AvailableAmount != 150 {
+		t.Fatalf("snapshot did not capture applied total: %+v", view.ClosureSnapshot)
+	}
+}
+
+func TestClosureSurvivesReconnection(t *testing.T) {
+	store := testStore(t)
+	from, to := activeWindow()
+	id := uniqueID(t)
+	mustCreate(t, store, id, 100, from, to)
+	ctx := context.Background()
+	if _, _, err := store.CreateReservation(ctx, id, "res-1", "dept-a", 40); err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	expireEntitlement(t, store, id)
+	closed, _ := store.GetView(ctx, id)
+	if closed.Status != StatusClosed {
+		t.Fatalf("not closed: %+v", closed)
+	}
+
+	pool, err := pgxpool.New(ctx, os.Getenv("TEST_DATABASE_URL"))
+	if err != nil {
+		t.Fatalf("reconnect: %v", err)
+	}
+	defer pool.Close()
+	restarted := NewStore(pool)
+	view, err := restarted.GetView(ctx, id)
+	if err != nil {
+		t.Fatalf("view after restart: %v", err)
+	}
+	if view.Status != StatusClosed || view.ClosedAt == nil || !view.ClosedAt.Equal(*closed.ClosedAt) ||
+		view.ClosureSnapshot == nil || view.ClosureSnapshot.ReservedAmount != 40 {
+		t.Fatalf("closure state lost across restart: %+v", view)
+	}
+	_, _, err = restarted.CreateReservation(ctx, id, "res-2", "dept-a", 1)
+	wantCode(t, err, CodeEntitlementClosed)
+}
+
+func TestConcurrentClosureWritesOneSnapshot(t *testing.T) {
+	store := testStore(t)
+	from, to := activeWindow()
+	id := uniqueID(t)
+	mustCreate(t, store, id, 100, from, to)
+	ctx := context.Background()
+	expireEntitlement(t, store, id)
+
+	const workers = 12
+	var wg sync.WaitGroup
+	errs := make(chan error, workers)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			view, err := store.GetView(ctx, id)
+			if err == nil && (view.Status != StatusClosed || view.ClosureSnapshot == nil) {
+				err = fmt.Errorf("unexpected view %+v", view)
+			}
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent closure: %v", err)
+		}
+	}
+	var count int
+	if err := store.pool.QueryRow(ctx,
+		`SELECT count(*) FROM closure_snapshots WHERE entitlement_id = $1`, id).Scan(&count); err != nil {
+		t.Fatalf("count snapshots: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("want one snapshot, got %d", count)
+	}
+}
+
+func pauseResumeEntitlement(t *testing.T) (*Store, string, time.Time, time.Time) {
+	t.Helper()
+	store := testStore(t)
+	from := time.Now().Add(-time.Hour).UTC().Truncate(time.Microsecond)
+	to := time.Now().Add(time.Hour).UTC().Truncate(time.Microsecond)
+	id := uniqueID(t)
+	mustCreate(t, store, id, 100, from, to)
+	return store, id, from, to
+}
+
+func TestPauseResumeLifecycle(t *testing.T) {
+	store, id, from, _ := pauseResumeEntitlement(t)
+	ctx := context.Background()
+	pauseAt := from.Add(30 * time.Minute)
+	resumeAt := time.Now().Add(10 * time.Minute).UTC().Truncate(time.Microsecond)
+
+	// An in-flight hold created before the pause must keep settling later.
+	if _, _, err := store.CreateReservation(ctx, id, "res-held", "dept-a", 20); err != nil {
+		t.Fatalf("reserve before pause: %v", err)
+	}
+
+	// First pause takes effect and leaves an audit event.
+	pause, created, err := store.PauseEntitlement(ctx, id, "pause-1", pauseAt)
+	if err != nil || !created || pause.Kind != KindPause || !pause.At.Equal(pauseAt) {
+		t.Fatalf("pause: %+v created=%v err=%v", pause, created, err)
+	}
+	view, _ := store.GetView(ctx, id)
+	if len(view.PauseResume) != 1 || view.PauseResume[0].ID != "pause-1" ||
+		view.PauseResume[0].Kind != KindPause || !view.PauseResume[0].At.Equal(pauseAt) {
+		t.Fatalf("pause event not in view: %+v", view.PauseResume)
+	}
+
+	// A paused entitlement refuses new reservations but figures are unchanged.
+	_, _, err = store.CreateReservation(ctx, id, "res-new", "dept-a", 10)
+	wantCode(t, err, CodeEntitlementPaused)
+	view, _ = store.GetView(ctx, id)
+	if view.QuotaTotal != 100 || view.UsedAmount != 0 || view.ReservedAmount != 20 ||
+		view.AvailableAmount != 80 || view.SeatsTotal != 100 {
+		t.Fatalf("pause moved a figure: %+v", view)
+	}
+	// Quota and seat adjustments are not pause operations and stay allowed.
+	if _, _, err := store.CreateAdjustment(ctx, id, "adj-1", 10, time.Now().Add(-time.Minute)); err != nil {
+		t.Fatalf("adjustment while paused: %v", err)
+	}
+	if _, _, err := store.CreateSeatAdjustment(ctx, id, "seat-1", 10); err != nil {
+		t.Fatalf("seat adjustment while paused: %v", err)
+	}
+
+	// Settlement of the in-flight hold and corrective reversal are unaffected.
+	if _, err := store.SettleReservation(ctx, id, "res-held", ActionConfirm); err != nil {
+		t.Fatalf("confirm while paused: %v", err)
+	}
+	if _, _, err := store.ReverseReservation(ctx, id, "res-held", "corr-1"); err != nil {
+		t.Fatalf("reverse while paused: %v", err)
+	}
+
+	// Resume reopens grant issuance; no figure moved by either event.
+	if _, _, err := store.ResumeEntitlement(ctx, id, "resume-1", resumeAt); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if _, _, err := store.CreateReservation(ctx, id, "res-after", "dept-a", 15); err != nil {
+		t.Fatalf("reserve after resume: %v", err)
+	}
+	view, _ = store.GetView(ctx, id)
+	if view.ReservedAmount != 15 || view.AvailableAmount != view.QuotaTotal-view.UsedAmount-15 ||
+		len(view.PauseResume) != 2 {
+		t.Fatalf("state after resume: %+v", view)
+	}
+	if view.PauseResume[1].ID != "resume-1" || view.PauseResume[1].Kind != KindResume {
+		t.Fatalf("resume event missing/ordered wrong: %+v", view.PauseResume)
+	}
+}
+
+func TestPauseResumeIdempotency(t *testing.T) {
+	store, id, _, to := pauseResumeEntitlement(t)
+	ctx := context.Background()
+	pauseAt := time.Now().Add(-10 * time.Minute).UTC().Truncate(time.Microsecond)
+
+	first, created, err := store.PauseEntitlement(ctx, id, "ev-1", pauseAt)
+	if err != nil || !created {
+		t.Fatalf("first pause: %+v created=%v err=%v", first, created, err)
+	}
+	// Same identifier, same kind and time: original record, no second effect.
+	replay, created, err := store.PauseEntitlement(ctx, id, "ev-1", pauseAt)
+	if err != nil || created || replay.ID != first.ID || !replay.CreatedAt.Equal(first.CreatedAt) {
+		t.Fatalf("pause replay: %+v created=%v err=%v", replay, created, err)
+	}
+	view, _ := store.GetView(ctx, id)
+	if len(view.PauseResume) != 1 {
+		t.Fatalf("replay registered another event: %+v", view.PauseResume)
+	}
+	// Same identifier with a different time fails and changes nothing.
+	_, _, err = store.PauseEntitlement(ctx, id, "ev-1", pauseAt.Add(time.Minute))
+	wantCode(t, err, CodePauseResumeParamChanged)
+	// The identifiers are independent across kinds but still share one
+	// namespace: the same identifier used for a resume mismatches the pause.
+	resumeAt := time.Now().Add(10 * time.Minute).UTC().Truncate(time.Microsecond)
+	_, _, err = store.ResumeEntitlement(ctx, id, "ev-1", resumeAt)
+	wantCode(t, err, CodePauseResumeParamChanged)
+	view, _ = store.GetView(ctx, id)
+	if len(view.PauseResume) != 1 {
+		t.Fatalf("mismatching calls registered events: %+v", view.PauseResume)
+	}
+
+	// A fresh resume identifier undoes the pause; its replay is idempotent.
+	resumed, created, err := store.ResumeEntitlement(ctx, id, "resume-1", resumeAt)
+	if err != nil || !created || resumed.Kind != KindResume {
+		t.Fatalf("resume: %+v created=%v err=%v", resumed, created, err)
+	}
+	replayResume, created, err := store.ResumeEntitlement(ctx, id, "resume-1", resumeAt)
+	if err != nil || created || replayResume.ID != "resume-1" {
+		t.Fatalf("resume replay: %+v created=%v err=%v", replayResume, created, err)
+	}
+	// Resuming again without a matching pause is a state violation.
+	_, _, err = store.ResumeEntitlement(ctx, id, "resume-2", resumeAt.Add(time.Minute))
+	wantCode(t, err, CodeEntitlementNotPaused)
+	// After resume, grants flow again and another pause is allowed.
+	if _, _, err := store.CreateReservation(ctx, id, "res-1", "dept-a", 10); err != nil {
+		t.Fatalf("reserve after resume: %v", err)
+	}
+	if _, _, err := store.PauseEntitlement(ctx, id, "pause-2", to.Add(-time.Minute)); err != nil {
+		t.Fatalf("second pause after resume: %v", err)
+	}
+	_, _, err = store.PauseEntitlement(ctx, id, "pause-3", to.Add(-time.Second))
+	wantCode(t, err, CodeEntitlementAlreadyPaused)
+}
+
+func TestPauseResumeValidation(t *testing.T) {
+	store, id, from, to := pauseResumeEntitlement(t)
+	ctx := context.Background()
+
+	// Unknown entitlement, bad identifier, missing time.
+	_, _, err := store.PauseEntitlement(ctx, "ent-404", "pause-1", from.Add(time.Minute))
+	wantCode(t, err, CodeEntitlementNotFound)
+	_, _, err = store.PauseEntitlement(ctx, id, "bad id!", from.Add(time.Minute))
+	wantCode(t, err, CodeInvalidRequest)
+	_, _, err = store.PauseEntitlement(ctx, id, "pause-1", time.Time{})
+	wantCode(t, err, CodeInvalidRequest)
+	// Pause outside the window.
+	_, _, err = store.PauseEntitlement(ctx, id, "pause-early", from.Add(-time.Minute))
+	wantCode(t, err, CodeInvalidRequest)
+	_, _, err = store.PauseEntitlement(ctx, id, "pause-late", to.Add(time.Minute))
+	wantCode(t, err, CodeInvalidRequest)
+
+	// Bounds are inclusive: exactly at the start and at the end are allowed.
+	if _, _, err := store.PauseEntitlement(ctx, id, "pause-at-start", from); err != nil {
+		t.Fatalf("pause at valid_from: %v", err)
+	}
+	// Cannot resume at or before the pause time, nor after the window ends.
+	_, _, err = store.ResumeEntitlement(ctx, id, "resume-same", from)
+	wantCode(t, err, CodeInvalidRequest)
+	_, _, err = store.ResumeEntitlement(ctx, id, "resume-early", from.Add(-time.Minute))
+	wantCode(t, err, CodeInvalidRequest)
+	_, _, err = store.ResumeEntitlement(ctx, id, "resume-late", to.Add(time.Minute))
+	wantCode(t, err, CodeInvalidRequest)
+	// A resume at exactly valid_to is accepted and must be later than pause.
+	resumed, _, err := store.ResumeEntitlement(ctx, id, "resume-at-end", to)
+	if err != nil || resumed.Kind != KindResume {
+		t.Fatalf("resume at valid_to: %+v err=%v", resumed, err)
+	}
+	// Nothing was written by the failed attempts, and no figure moved.
+	view, _ := store.GetView(ctx, id)
+	if len(view.PauseResume) != 2 || view.QuotaTotal != 100 || view.SeatsTotal != 100 {
+		t.Fatalf("failed pause/resume left partial state: %+v", view)
+	}
+	ids := []string{view.PauseResume[0].ID, view.PauseResume[1].ID}
+	if ids[0] != "pause-at-start" || ids[1] != "resume-at-end" {
+		t.Fatalf("pause/resume list not in registration order: %v", ids)
+	}
+}
+
+func TestPauseBlockedAfterClosure(t *testing.T) {
+	store, id, _, to := pauseResumeEntitlement(t)
+	ctx := context.Background()
+	expireEntitlement(t, store, id)
+	// The pause attempt is itself the touch that closes the entitlement; a new
+	// pause is then refused even though its time lies in the original window.
+	_, _, err := store.PauseEntitlement(ctx, id, "pause-1", to.Add(-time.Minute))
+	wantCode(t, err, CodeEntitlementClosed)
+	view, _ := store.GetView(ctx, id)
+	if view.Status != StatusClosed || len(view.PauseResume) != 0 {
+		t.Fatalf("pause after closure changed state: %+v", view)
+	}
+}
+
+func TestPausedEntitlementStillClosesOnExpiry(t *testing.T) {
+	store, id, from, _ := pauseResumeEntitlement(t)
+	ctx := context.Background()
+	if _, _, err := store.PauseEntitlement(ctx, id, "pause-1", from.Add(time.Minute)); err != nil {
+		t.Fatalf("pause: %v", err)
+	}
+	expireEntitlement(t, store, id)
+	view, _ := store.GetView(ctx, id)
+	if view.Status != StatusClosed || view.ClosedAt == nil || view.ClosureSnapshot == nil {
+		t.Fatalf("paused entitlement did not close: %+v", view)
+	}
+	if len(view.PauseResume) != 1 || view.PauseResume[0].ID != "pause-1" {
+		t.Fatalf("pause history lost at closure: %+v", view.PauseResume)
+	}
+	// Closure takes precedence over the pause error for a new grant.
+	_, _, err := store.CreateReservation(ctx, id, "res-1", "dept-a", 1)
+	wantCode(t, err, CodeEntitlementClosed)
+}
+
+func TestPauseResumeSurviveReconnection(t *testing.T) {
+	store, id, _, to := pauseResumeEntitlement(t)
+	ctx := context.Background()
+	pauseAt := time.Now().Add(-30 * time.Minute).UTC().Truncate(time.Microsecond)
+	if _, _, err := store.PauseEntitlement(ctx, id, "pause-1", pauseAt); err != nil {
+		t.Fatalf("pause: %v", err)
+	}
+
+	pool, err := pgxpool.New(ctx, os.Getenv("TEST_DATABASE_URL"))
+	if err != nil {
+		t.Fatalf("reconnect: %v", err)
+	}
+	defer pool.Close()
+	restarted := NewStore(pool)
+	view, err := restarted.GetView(ctx, id)
+	if err != nil {
+		t.Fatalf("view after restart: %v", err)
+	}
+	if len(view.PauseResume) != 1 || view.PauseResume[0].ID != "pause-1" ||
+		view.PauseResume[0].Kind != KindPause || !view.PauseResume[0].At.Equal(pauseAt) {
+		t.Fatalf("pause history lost across restart: %+v", view.PauseResume)
+	}
+	// The paused flag persisted: grants are still refused.
+	_, _, err = restarted.CreateReservation(ctx, id, "res-1", "dept-a", 1)
+	wantCode(t, err, CodeEntitlementPaused)
+	// The pause replay returns the original record; a resume then reopens.
+	if _, created, err := restarted.PauseEntitlement(ctx, id, "pause-1", pauseAt); err != nil || created {
+		t.Fatalf("pause replay after restart: created=%v err=%v", created, err)
+	}
+	if _, _, err := restarted.ResumeEntitlement(ctx, id, "resume-1", to.Add(-time.Minute)); err != nil {
+		t.Fatalf("resume after restart: %v", err)
+	}
+	if _, _, err := restarted.CreateReservation(ctx, id, "res-1", "dept-a", 1); err != nil {
+		t.Fatalf("reserve after resumed restart: %v", err)
+	}
 }

@@ -53,6 +53,7 @@ type fakeService struct {
 	adjustment     entitlements.Adjustment
 	reschedule     entitlements.Reschedule
 	seatAdjustment entitlements.SeatAdjustment
+	pauseResume    entitlements.PauseResumeEvent
 	created        bool
 	view           entitlements.View
 	err            error
@@ -62,6 +63,8 @@ type fakeService struct {
 	delta          int64
 	rescheduleID   string
 	departmentID   string
+	pauseResumeID  string
+	pauseResumeAt  time.Time
 }
 
 func (f *fakeService) CreateEntitlement(_ context.Context, _ entitlements.CreateEntitlementInput) (entitlements.Entitlement, error) {
@@ -98,6 +101,18 @@ func (f *fakeService) CreateSeatAdjustment(_ context.Context, _, seatAdjustmentI
 	f.adjustmentID = seatAdjustmentID
 	f.delta = delta
 	return f.seatAdjustment, f.created, f.err
+}
+
+func (f *fakeService) PauseEntitlement(_ context.Context, _, eventID string, at time.Time) (entitlements.PauseResumeEvent, bool, error) {
+	f.pauseResumeID = eventID
+	f.pauseResumeAt = at
+	return f.pauseResume, f.created, f.err
+}
+
+func (f *fakeService) ResumeEntitlement(_ context.Context, _, eventID string, at time.Time) (entitlements.PauseResumeEvent, bool, error) {
+	f.pauseResumeID = eventID
+	f.pauseResumeAt = at
+	return f.pauseResume, f.created, f.err
 }
 
 func (f *fakeService) GetView(_ context.Context, _ string) (entitlements.View, error) {
@@ -152,6 +167,11 @@ func TestErrorMapping(t *testing.T) {
 		{"adjustment param mismatch", entitlements.CodeAdjustmentParamChanged, 409},
 		{"reschedule param mismatch", entitlements.CodeRescheduleParamChanged, 409},
 		{"seat adjustment param mismatch", entitlements.CodeSeatAdjustmentChanged, 409},
+		{"closed", entitlements.CodeEntitlementClosed, 409},
+		{"pause/resume param mismatch", entitlements.CodePauseResumeParamChanged, 409},
+		{"paused", entitlements.CodeEntitlementPaused, 422},
+		{"already paused", entitlements.CodeEntitlementAlreadyPaused, 409},
+		{"not paused", entitlements.CodeEntitlementNotPaused, 409},
 		{"internal", "unmapped", 500},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -420,5 +440,95 @@ func TestGetEntitlementView(t *testing.T) {
 	}
 	if !strings.Contains(response.Body.String(), `"seat_adjustments":[{"seat_adjustment_id":"seat-1","delta":10,"seat_total":110`) {
 		t.Fatalf("seat adjustments missing from view: %q", response.Body.String())
+	}
+}
+
+func TestPauseResumeRoutes(t *testing.T) {
+	pauseEvent := entitlements.PauseResumeEvent{
+		ID: "pause-1", Kind: entitlements.KindPause,
+		At:        time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC),
+		CreatedAt: time.Now(),
+	}
+	resumeEvent := entitlements.PauseResumeEvent{
+		ID: "resume-1", Kind: entitlements.KindResume,
+		At:        time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC),
+		CreatedAt: time.Now(),
+	}
+
+	service := &fakeService{pauseResume: pauseEvent, created: true}
+	created := serve(t, service, "POST", "/entitlements/ent-1/pauses",
+		`{"pause_id":"pause-1","paused_at":"2026-06-01T00:00:00Z"}`)
+	if created.Code != 201 || service.pauseResumeID != "pause-1" ||
+		!service.pauseResumeAt.Equal(pauseEvent.At) {
+		t.Fatalf("new pause: status=%d id=%q at=%v body=%q",
+			created.Code, service.pauseResumeID, service.pauseResumeAt, created.Body.String())
+	}
+	if !strings.Contains(created.Body.String(), `"id":"pause-1"`) ||
+		!strings.Contains(created.Body.String(), `"type":"pause"`) ||
+		!strings.Contains(created.Body.String(), `"at":"2026-06-01T00:00:00Z"`) {
+		t.Fatalf("pause body: %q", created.Body.String())
+	}
+	service.created = false
+	if replayed := serve(t, service, "POST", "/entitlements/ent-1/pauses",
+		`{"pause_id":"pause-1","paused_at":"2026-06-01T00:00:00Z"}`); replayed.Code != 200 {
+		t.Fatalf("replayed pause: status=%d body=%q", replayed.Code, replayed.Body.String())
+	}
+
+	service.pauseResume = resumeEvent
+	service.created = true
+	resumed := serve(t, service, "POST", "/entitlements/ent-1/resumes",
+		`{"resume_id":"resume-1","resumed_at":"2026-07-01T00:00:00Z"}`)
+	if resumed.Code != 201 || service.pauseResumeID != "resume-1" ||
+		!service.pauseResumeAt.Equal(resumeEvent.At) {
+		t.Fatalf("new resume: status=%d id=%q at=%v body=%q",
+			resumed.Code, service.pauseResumeID, service.pauseResumeAt, resumed.Body.String())
+	}
+	if !strings.Contains(resumed.Body.String(), `"id":"resume-1"`) ||
+		!strings.Contains(resumed.Body.String(), `"type":"resume"`) {
+		t.Fatalf("resume body: %q", resumed.Body.String())
+	}
+
+	// Missing/unparseable timestamps, unknown fields and malformed JSON are
+	// rejected before the domain is called; a missing event id reaches the
+	// domain, which validates it.
+	for _, tc := range []struct {
+		path, body string
+	}{
+		{"/entitlements/ent-1/pauses", `{"pause_id":"pause-1"}`},
+		{"/entitlements/ent-1/pauses", `{"pause_id":"pause-1","paused_at":"soon"}`},
+		{"/entitlements/ent-1/pauses", `{"pause_id":"pause-1","paused_at":"2026-06-01T00:00:00Z","x":1}`},
+		{"/entitlements/ent-1/pauses", `{`},
+		{"/entitlements/ent-1/resumes", `{"resume_id":"resume-1"}`},
+		{"/entitlements/ent-1/resumes", `{"resume_id":"resume-1","resumed_at":"soon"}`},
+	} {
+		response := serve(t, service, "POST", tc.path, tc.body)
+		if response.Code != 400 || !strings.Contains(response.Body.String(), `"invalid_request"`) {
+			t.Fatalf("body %q to %s: status=%d body=%q", tc.body, tc.path, response.Code, response.Body.String())
+		}
+	}
+	invalid := &fakeService{err: &entitlements.Error{Code: entitlements.CodeInvalidRequest, Message: "bad id"}}
+	response := serve(t, invalid, "POST", "/entitlements/ent-1/pauses",
+		`{"paused_at":"2026-06-01T00:00:00Z"}`)
+	if response.Code != 400 || !strings.Contains(response.Body.String(), `"invalid_request"`) {
+		t.Fatalf("missing pause_id: status=%d body=%q", response.Code, response.Body.String())
+	}
+
+	// Domain failures keep their stable status and envelope.
+	for _, tc := range []struct {
+		path, body, code string
+		want             int
+	}{
+		{"/entitlements/ent-404/pauses", `{"pause_id":"p","paused_at":"2026-06-01T00:00:00Z"}`, entitlements.CodeEntitlementNotFound, 404},
+		{"/entitlements/ent-1/pauses", `{"pause_id":"p","paused_at":"2026-06-01T00:00:00Z"}`, entitlements.CodeEntitlementClosed, 409},
+		{"/entitlements/ent-1/pauses", `{"pause_id":"p","paused_at":"2026-06-01T00:00:00Z"}`, entitlements.CodeEntitlementAlreadyPaused, 409},
+		{"/entitlements/ent-1/pauses", `{"pause_id":"p","paused_at":"2026-06-01T00:00:00Z"}`, entitlements.CodePauseResumeParamChanged, 409},
+		{"/entitlements/ent-1/resumes", `{"resume_id":"r","resumed_at":"2026-07-01T00:00:00Z"}`, entitlements.CodeEntitlementNotPaused, 409},
+		{"/entitlements/ent-1/pauses", `{"pause_id":"p","paused_at":"2026-01-01T00:00:00Z"}`, entitlements.CodeEntitlementPaused, 422},
+	} {
+		failing := &fakeService{err: &entitlements.Error{Code: tc.code, Message: "boom"}}
+		response := serve(t, failing, "POST", tc.path, tc.body)
+		if response.Code != tc.want || !strings.Contains(response.Body.String(), `"`+tc.code+`"`) {
+			t.Fatalf("code %q: status=%d body=%q", tc.code, response.Code, response.Body.String())
+		}
 	}
 }

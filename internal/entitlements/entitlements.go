@@ -2,9 +2,10 @@
 // entitlement creation, idempotent reservations (each tagged with the
 // owning internal department), confirm/release settlement, corrective
 // reversals of confirmed reservations, scheduled quota-total adjustments,
-// idempotent validity-window reschedules, and immediate idempotent
-// adjustments of the seat total (seat allocation and recovery), persisted
-// in PostgreSQL.
+// idempotent validity-window reschedules, immediate idempotent
+// adjustments of the seat total (seat allocation and recovery),
+// one-way expiry closure with a close-time accounting snapshot, and
+// caller-timed pause/resume of grant issuance, persisted in PostgreSQL.
 package entitlements
 
 import (
@@ -22,19 +23,24 @@ import (
 // Error codes returned to API callers. They are stable identifiers; clients
 // should branch on Code, not on Message.
 const (
-	CodeInvalidRequest          = "invalid_request"
-	CodeEntitlementExists       = "entitlement_exists"
-	CodeEntitlementNotFound     = "entitlement_not_found"
-	CodeEntitlementNotActive    = "entitlement_not_active"
-	CodeInsufficientQuota       = "insufficient_quota"
-	CodeReservationNotFound     = "reservation_not_found"
-	CodeReservationParamChanged = "reservation_param_mismatch"
-	CodeReservationSettled      = "reservation_already_settled"
-	CodeReservationNotConfirmed = "reservation_not_confirmed"
-	CodeReservationReversed     = "reservation_already_reversed"
-	CodeAdjustmentParamChanged  = "adjustment_param_mismatch"
-	CodeRescheduleParamChanged  = "reschedule_param_mismatch"
-	CodeSeatAdjustmentChanged   = "seat_adjustment_param_mismatch"
+	CodeInvalidRequest           = "invalid_request"
+	CodeEntitlementExists        = "entitlement_exists"
+	CodeEntitlementNotFound      = "entitlement_not_found"
+	CodeEntitlementNotActive     = "entitlement_not_active"
+	CodeInsufficientQuota        = "insufficient_quota"
+	CodeReservationNotFound      = "reservation_not_found"
+	CodeReservationParamChanged  = "reservation_param_mismatch"
+	CodeReservationSettled       = "reservation_already_settled"
+	CodeReservationNotConfirmed  = "reservation_not_confirmed"
+	CodeReservationReversed      = "reservation_already_reversed"
+	CodeAdjustmentParamChanged   = "adjustment_param_mismatch"
+	CodeRescheduleParamChanged   = "reschedule_param_mismatch"
+	CodeSeatAdjustmentChanged    = "seat_adjustment_param_mismatch"
+	CodeEntitlementClosed        = "entitlement_closed"
+	CodePauseResumeParamChanged  = "pause_resume_param_mismatch"
+	CodeEntitlementPaused        = "entitlement_paused"
+	CodeEntitlementAlreadyPaused = "entitlement_already_paused"
+	CodeEntitlementNotPaused     = "entitlement_not_paused"
 )
 
 // Error is a domain failure with a stable machine-readable code.
@@ -57,6 +63,19 @@ const (
 	StatusReleased  = "released"
 	StatusReversed  = "reversed"
 	StatusApplied   = "applied"
+)
+
+// StatusClosed is the one-way lifecycle state of an entitlement whose
+// validity time has elapsed: it stops accepting new grants and changes but
+// keeps settling in-flight reservations. Unlike "expired" — a window-relative
+// view label that can flip back to "active" after a reschedule — closure is
+// permanent.
+const StatusClosed = "closed"
+
+// Pause and resume event kinds.
+const (
+	KindPause  = "pause"
+	KindResume = "resume"
 )
 
 // Settlement actions.
@@ -147,6 +166,37 @@ type SeatAdjustment struct {
 	CreatedAt        time.Time `json:"created_at"`
 }
 
+// ClosureSnapshot is the accounting record written exactly once when an
+// entitlement closes after its validity time has elapsed. It is keyed by the
+// entitlement identifier and freezes the figures at the close instant: the
+// seat total, quota total, used quota, unsettled reservations, available
+// quota, the validity window in force and the close time. Every figure is
+// the actual state at that moment; closure itself changes none of them.
+type ClosureSnapshot struct {
+	EntitlementID   string    `json:"entitlement_id"`
+	SeatsTotal      int64     `json:"seats_total"`
+	QuotaTotal      int64     `json:"quota_total"`
+	UsedAmount      int64     `json:"used_amount"`
+	ReservedAmount  int64     `json:"reserved_amount"`
+	AvailableAmount int64     `json:"available_amount"`
+	ValidFrom       time.Time `json:"valid_from"`
+	ValidTo         time.Time `json:"valid_to"`
+	ClosedAt        time.Time `json:"closed_at"`
+}
+
+// PauseResumeEvent is a caller-registered pause or resume of grant issuance,
+// identified by the caller-supplied business identifier, unique within the
+// entitlement and independent across the two kinds. At is the caller-supplied
+// pause or resume time: a pause lies within the validity window, and a resume
+// lies later than its matching pause and no later than the validity end.
+// Neither event changes any quota figure, seat figure or validity window.
+type PauseResumeEvent struct {
+	ID        string    `json:"id"`
+	Kind      string    `json:"type"` // "pause" or "resume"
+	At        time.Time `json:"at"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
 // adjustmentStatus derives the lifecycle state from the application
 // timestamp.
 func adjustmentStatus(appliedAt *time.Time) string {
@@ -166,21 +216,28 @@ func adjustmentStatus(appliedAt *time.Time) string {
 // reported ValidFrom/ValidTo and Status always reflect the latest one.
 // SeatAdjustments lists every seat-total adjustment in creation order, each
 // with the cumulative seat total produced by summing deltas in that order;
-// none of the quota figures above is affected by it.
+// none of the quota figures above is affected by it. ClosedAt is set once the
+// entitlement has closed after its validity end, and ClosureSnapshot then
+// carries the close-time accounting record (nil/empty before closure).
+// PauseResumeEvents lists every pause and resume in registration order; the
+// last entry determines whether issuance is currently paused.
 type View struct {
-	EntitlementID   string           `json:"entitlement_id"`
-	SeatsTotal      int64            `json:"seats_total"`
-	QuotaTotal      int64            `json:"quota_total"`
-	UsedAmount      int64            `json:"used_amount"`
-	ReservedAmount  int64            `json:"reserved_amount"`
-	AvailableAmount int64            `json:"available_amount"`
-	Status          string           `json:"status"` // pending, active or expired
-	ValidFrom       time.Time        `json:"valid_from"`
-	ValidTo         time.Time        `json:"valid_to"`
-	Reservations    []Reservation    `json:"reservations"`
-	Adjustments     []Adjustment     `json:"adjustments"`
-	Reschedules     []Reschedule     `json:"reschedules"`
-	SeatAdjustments []SeatAdjustment `json:"seat_adjustments"`
+	EntitlementID   string             `json:"entitlement_id"`
+	SeatsTotal      int64              `json:"seats_total"`
+	QuotaTotal      int64              `json:"quota_total"`
+	UsedAmount      int64              `json:"used_amount"`
+	ReservedAmount  int64              `json:"reserved_amount"`
+	AvailableAmount int64              `json:"available_amount"`
+	Status          string             `json:"status"` // pending, active, expired or closed
+	ValidFrom       time.Time          `json:"valid_from"`
+	ValidTo         time.Time          `json:"valid_to"`
+	ClosedAt        *time.Time         `json:"closed_at,omitempty"`
+	ClosureSnapshot *ClosureSnapshot   `json:"closure_snapshot,omitempty"`
+	PauseResume     []PauseResumeEvent `json:"pause_resume_events"`
+	Reservations    []Reservation      `json:"reservations"`
+	Adjustments     []Adjustment       `json:"adjustments"`
+	Reschedules     []Reschedule       `json:"reschedules"`
+	SeatAdjustments []SeatAdjustment   `json:"seat_adjustments"`
 }
 
 var identifierPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
@@ -266,7 +323,41 @@ CREATE TABLE IF NOT EXISTS seat_adjustments (
     seat_total         BIGINT NOT NULL CHECK (seat_total > 0),
     created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (entitlement_id, seat_adjustment_id)
-);`)
+);
+-- Closure is one-way: closed_at is set exactly once, by the first write or
+-- view that touches the entitlement after its validity end, inside the same
+-- transaction and row lock as that touch. paused_at marks an entitlement
+-- whose grant issuance is currently suspended; null means issuing normally.
+ALTER TABLE entitlements ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ;
+ALTER TABLE entitlements ADD COLUMN IF NOT EXISTS paused_at TIMESTAMPTZ;
+-- The accounting record frozen at the close instant. Exactly one row per
+-- entitlement, written together with closed_at, so repeated touches after
+-- expiry can never produce a second close record.
+CREATE TABLE IF NOT EXISTS closure_snapshots (
+    entitlement_id   TEXT PRIMARY KEY REFERENCES entitlements (entitlement_id),
+    seats_total      BIGINT NOT NULL CHECK (seats_total > 0),
+    quota_total      BIGINT NOT NULL CHECK (quota_total > 0),
+    used_amount      BIGINT NOT NULL CHECK (used_amount >= 0),
+    reserved_amount  BIGINT NOT NULL CHECK (reserved_amount >= 0),
+    available_amount BIGINT NOT NULL CHECK (available_amount >= 0),
+    valid_from       TIMESTAMPTZ NOT NULL,
+    valid_to         TIMESTAMPTZ NOT NULL,
+    closed_at        TIMESTAMPTZ NOT NULL
+);
+-- Caller-registered pause and resume events. The business identifier is
+-- unique within an entitlement and shared across both kinds (an identifier
+-- used for a pause cannot be reused for a resume with different data); the
+-- kind is recorded on each row.
+CREATE TABLE IF NOT EXISTS pause_resume_events (
+    entitlement_id TEXT NOT NULL REFERENCES entitlements (entitlement_id),
+    event_id       TEXT NOT NULL,
+    kind           TEXT NOT NULL CHECK (kind IN ('pause', 'resume')),
+    at             TIMESTAMPTZ NOT NULL,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (entitlement_id, event_id)
+);
+CREATE INDEX IF NOT EXISTS idx_pause_resume_events_order
+    ON pause_resume_events (entitlement_id, created_at, event_id);`)
 	if err != nil {
 		return fmt.Errorf("migrate schema: %w", err)
 	}
@@ -333,15 +424,18 @@ type entitlementRow struct {
 	validFrom  time.Time
 	validTo    time.Time
 	now        time.Time
+	closedAt   *time.Time
+	pausedAt   *time.Time
 }
 
 // lockEntitlement takes the per-entitlement serialization lock inside tx.
 func lockEntitlement(ctx context.Context, tx pgx.Tx, entitlementID string) (entitlementRow, error) {
 	var row entitlementRow
 	err := tx.QueryRow(ctx, `
-SELECT seats_total, quota_total, used_amount, valid_from, valid_to, now()
+SELECT seats_total, quota_total, used_amount, valid_from, valid_to, now(), closed_at, paused_at
 FROM entitlements WHERE entitlement_id = $1 FOR UPDATE`, entitlementID).
-		Scan(&row.seatsTotal, &row.quotaTotal, &row.usedAmount, &row.validFrom, &row.validTo, &row.now)
+		Scan(&row.seatsTotal, &row.quotaTotal, &row.usedAmount, &row.validFrom, &row.validTo,
+			&row.now, &row.closedAt, &row.pausedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return entitlementRow{}, fail(CodeEntitlementNotFound, "entitlement %q does not exist", entitlementID)
 	}
@@ -349,6 +443,57 @@ FROM entitlements WHERE entitlement_id = $1 FOR UPDATE`, entitlementID).
 		return entitlementRow{}, fmt.Errorf("lock entitlement: %w", err)
 	}
 	return row, nil
+}
+
+// closeIfDue performs closure exactly once: if the validity end has arrived
+// and the entitlement is not closed yet, it writes the closure snapshot with
+// the figures at the close instant and stamps closed_at, all inside the
+// caller's transaction under the row lock. A later reschedule can move the
+// window back over the current time; closed_at stays set, so closure is
+// one-way. Repeated touches find closed_at already set and neither insert a
+// second snapshot nor move the close time. The snapshot is taken after due
+// adjustments have been folded in, so it reflects the actual state at the
+// close instant; closure itself changes no quota or seat figure.
+func closeIfDue(ctx context.Context, tx pgx.Tx, ent *entitlementRow, entitlementID string) error {
+	if ent.closedAt != nil || ent.now.Before(ent.validTo) {
+		return nil
+	}
+	reserved, err := pendingAmount(ctx, tx, entitlementID)
+	if err != nil {
+		return err
+	}
+	available := ent.quotaTotal - ent.usedAmount - reserved
+	closedAt := ent.now
+	if _, err := tx.Exec(ctx, `
+INSERT INTO closure_snapshots
+    (entitlement_id, seats_total, quota_total, used_amount, reserved_amount,
+     available_amount, valid_from, valid_to, closed_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		entitlementID, ent.seatsTotal, ent.quotaTotal, ent.usedAmount, reserved,
+		available, ent.validFrom, ent.validTo, closedAt); err != nil {
+		return fmt.Errorf("insert closure snapshot: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+UPDATE entitlements SET closed_at = $1
+WHERE entitlement_id = $2 AND closed_at IS NULL`,
+		closedAt, entitlementID); err != nil {
+		return fmt.Errorf("stamp closure: %w", err)
+	}
+	ent.closedAt = &closedAt
+	return nil
+}
+
+// ensureOpen rejects the write types that closure stops: new reservations,
+// quota adjustments, seat adjustments and reschedules. Settlement and
+// corrective reversal of in-flight reservations stay allowed, so they must
+// not call this guard.
+func ensureOpen(ent *entitlementRow, entitlementID string) *Error {
+	if ent.closedAt != nil {
+		return fail(CodeEntitlementClosed,
+			"entitlement %q closed at %s and no longer accepts this operation",
+			entitlementID, ent.closedAt.Format(time.RFC3339))
+	}
+	return nil
 }
 
 func pendingAmount(ctx context.Context, tx pgx.Tx, entitlementID string) (int64, error) {
@@ -476,6 +621,11 @@ func (s *Store) CreateReservation(ctx context.Context, entitlementID, reservatio
 	if err := applyDueAdjustments(ctx, tx, &ent, entitlementID); err != nil {
 		return Reservation{}, false, err
 	}
+	// Touching an entitlement whose validity end has passed closes it once,
+	// inside this same transaction.
+	if err := closeIfDue(ctx, tx, &ent, entitlementID); err != nil {
+		return Reservation{}, false, err
+	}
 
 	var existing Reservation
 	err = tx.QueryRow(ctx, `
@@ -499,6 +649,16 @@ FROM reservations WHERE entitlement_id = $1 AND reservation_id = $2`,
 		return existing, false, tx.Commit(ctx)
 	}
 
+	// A closed entitlement never grants again. An identical replay above
+	// still returns its original reservation, but a new identifier is refused.
+	if err := ensureOpen(&ent, entitlementID); err != nil {
+		return Reservation{}, false, err
+	}
+	if ent.pausedAt != nil {
+		return Reservation{}, false, fail(CodeEntitlementPaused,
+			"entitlement %q is paused (since %s) and does not accept new reservations",
+			entitlementID, ent.pausedAt.Format(time.RFC3339))
+	}
 	if ent.now.Before(ent.validFrom) || !ent.now.Before(ent.validTo) {
 		return Reservation{}, false, fail(CodeEntitlementNotActive,
 			"entitlement %q is not in its validity window", entitlementID)
@@ -546,6 +706,12 @@ func (s *Store) SettleReservation(ctx context.Context, entitlementID, reservatio
 		return Reservation{}, err
 	}
 	if err := applyDueAdjustments(ctx, tx, &ent, entitlementID); err != nil {
+		return Reservation{}, err
+	}
+	// An expired entitlement closes on this touch, but an in-flight
+	// reservation still settles exactly once afterwards; pausing does not
+	// block settlement either.
+	if err := closeIfDue(ctx, tx, &ent, entitlementID); err != nil {
 		return Reservation{}, err
 	}
 	var reservation Reservation
@@ -622,6 +788,11 @@ func (s *Store) ReverseReservation(ctx context.Context, entitlementID, reservati
 		return Reversal{}, false, err
 	}
 	if err := applyDueAdjustments(ctx, tx, &ent, entitlementID); err != nil {
+		return Reversal{}, false, err
+	}
+	// Closure happens on this touch but never blocks the correction of an
+	// already confirmed reservation.
+	if err := closeIfDue(ctx, tx, &ent, entitlementID); err != nil {
 		return Reversal{}, false, err
 	}
 
@@ -743,6 +914,11 @@ func (s *Store) CreateAdjustment(ctx context.Context, entitlementID, adjustmentI
 	if err := applyDueAdjustments(ctx, tx, &ent, entitlementID); err != nil {
 		return Adjustment{}, false, err
 	}
+	// An expired entitlement closes on this touch before the replay or the
+	// feasibility checks below.
+	if err := closeIfDue(ctx, tx, &ent, entitlementID); err != nil {
+		return Adjustment{}, false, err
+	}
 
 	var existing Adjustment
 	err = tx.QueryRow(ctx, `
@@ -762,6 +938,12 @@ FROM adjustments WHERE entitlement_id = $1 AND adjustment_id = $2`,
 		}
 		existing.Status = adjustmentStatus(existing.AppliedAt)
 		return existing, false, tx.Commit(ctx)
+	}
+
+	// A closed entitlement accepts no new quota adjustment; an identical
+	// replay above still returns the original record.
+	if err := ensureOpen(&ent, entitlementID); err != nil {
+		return Adjustment{}, false, err
 	}
 
 	if delta < 0 && ent.quotaTotal+delta <= 0 {
@@ -829,6 +1011,15 @@ func (s *Store) CreateSeatAdjustment(ctx context.Context, entitlementID, seatAdj
 	if err != nil {
 		return SeatAdjustment{}, false, err
 	}
+	// A touch folds due quota adjustments (the seat change itself still moves
+	// no quota figure) and closes an expired entitlement before the replay or
+	// the seat-total change below.
+	if err := applyDueAdjustments(ctx, tx, &ent, entitlementID); err != nil {
+		return SeatAdjustment{}, false, err
+	}
+	if err := closeIfDue(ctx, tx, &ent, entitlementID); err != nil {
+		return SeatAdjustment{}, false, err
+	}
 
 	var existing SeatAdjustment
 	err = tx.QueryRow(ctx, `
@@ -845,6 +1036,12 @@ FROM seat_adjustments WHERE entitlement_id = $1 AND seat_adjustment_id = $2`,
 				"seat adjustment %q already exists with delta %d, not %d", seatAdjustmentID, existing.Delta, delta)
 		}
 		return existing, false, tx.Commit(ctx)
+	}
+
+	// A closed entitlement accepts no new seat adjustment; an identical
+	// replay above still returns the original record.
+	if err := ensureOpen(&ent, entitlementID); err != nil {
+		return SeatAdjustment{}, false, err
 	}
 
 	newTotal := ent.seatsTotal + delta
@@ -923,7 +1120,16 @@ func (s *Store) RescheduleEntitlement(ctx context.Context, entitlementID, resche
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	if _, err := lockEntitlement(ctx, tx, entitlementID); err != nil {
+	ent, err := lockEntitlement(ctx, tx, entitlementID)
+	if err != nil {
+		return Reschedule{}, false, err
+	}
+	// Like every other touch, fold due adjustments and close an entitlement
+	// whose validity end has passed.
+	if err := applyDueAdjustments(ctx, tx, &ent, entitlementID); err != nil {
+		return Reschedule{}, false, err
+	}
+	if err := closeIfDue(ctx, tx, &ent, entitlementID); err != nil {
 		return Reschedule{}, false, err
 	}
 
@@ -944,6 +1150,13 @@ FROM reschedules WHERE entitlement_id = $1 AND reschedule_id = $2`,
 				newValidFrom.Format(time.RFC3339), newValidTo.Format(time.RFC3339))
 		}
 		return existing, false, tx.Commit(ctx)
+	}
+
+	// Closure is one-way: a closed entitlement cannot be reopened, so a new
+	// reschedule is refused even if its window covers the current time. An
+	// identical replay above still returns the original record.
+	if err := ensureOpen(&ent, entitlementID); err != nil {
+		return Reschedule{}, false, err
 	}
 
 	var created Reschedule
@@ -967,6 +1180,136 @@ UPDATE entitlements SET valid_from = $1, valid_to = $2 WHERE entitlement_id = $3
 	return created, true, nil
 }
 
+// registerPauseResume is the shared body of PauseEntitlement and
+// ResumeEntitlement. The caller-supplied eventID is unique within the
+// entitlement and shared across both kinds: resubmitting the same
+// identifier with the same kind and time returns the original record
+// without taking effect again (created=false); resubmitting it with a
+// different kind or time fails without changing state. A pause stamps
+// paused_at and is refused while already paused; a resume clears it and is
+// refused while not paused. Times are caller-supplied: a pause lies within
+// the validity window (bounds inclusive), and a resume lies strictly later
+// than the matching pause and no later than the validity end. Neither event
+// changes any quota figure, seat figure or the validity window, and both
+// run under the per-entitlement row lock, serializing with every other
+// flow. Like every other touch, the call first folds due adjustments and
+// performs the one-time closure if the validity end has passed.
+func (s *Store) registerPauseResume(ctx context.Context, entitlementID, eventID, kind string, at time.Time) (PauseResumeEvent, bool, error) {
+	if err := validIdentifier("event_id", eventID); err != nil {
+		return PauseResumeEvent{}, false, err
+	}
+	if at.IsZero() {
+		return PauseResumeEvent{}, false, fail(CodeInvalidRequest, "at is required (an RFC 3339 timestamp)")
+	}
+	at = at.UTC()
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return PauseResumeEvent{}, false, fmt.Errorf("begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	ent, err := lockEntitlement(ctx, tx, entitlementID)
+	if err != nil {
+		return PauseResumeEvent{}, false, err
+	}
+	if err := applyDueAdjustments(ctx, tx, &ent, entitlementID); err != nil {
+		return PauseResumeEvent{}, false, err
+	}
+	if err := closeIfDue(ctx, tx, &ent, entitlementID); err != nil {
+		return PauseResumeEvent{}, false, err
+	}
+
+	var existing PauseResumeEvent
+	err = tx.QueryRow(ctx, `
+SELECT event_id, kind, at, created_at FROM pause_resume_events
+WHERE entitlement_id = $1 AND event_id = $2`, entitlementID, eventID).
+		Scan(&existing.ID, &existing.Kind, &existing.At, &existing.CreatedAt)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return PauseResumeEvent{}, false, fmt.Errorf("load pause/resume event: %w", err)
+	}
+	if err == nil {
+		if existing.Kind != kind || !existing.At.Equal(at) {
+			return PauseResumeEvent{}, false, fail(CodePauseResumeParamChanged,
+				"event %q already exists with type %q and at %s, not type %q and at %s",
+				eventID, existing.Kind, existing.At.Format(time.RFC3339), kind, at.Format(time.RFC3339))
+		}
+		// An identical replay returns the original record and never changes
+		// the paused flag, even after closure.
+		return existing, false, tx.Commit(ctx)
+	}
+
+	// Pause and resume control issuance within the validity period; a closed
+	// entitlement has stopped issuing for good, so no new event is accepted
+	// (an identical replay above still returns its original record).
+	if err := ensureOpen(&ent, entitlementID); err != nil {
+		return PauseResumeEvent{}, false, err
+	}
+
+	// The time must lie inside the validity window; the resume must also
+	// come strictly after the pause it undoes.
+	if at.Before(ent.validFrom) || at.After(ent.validTo) {
+		return PauseResumeEvent{}, false, fail(CodeInvalidRequest,
+			"%s time %s must be within the validity window [%s, %s]",
+			kind, at.Format(time.RFC3339), ent.validFrom.Format(time.RFC3339), ent.validTo.Format(time.RFC3339))
+	}
+	if kind == KindPause {
+		if ent.pausedAt != nil {
+			return PauseResumeEvent{}, false, fail(CodeEntitlementAlreadyPaused,
+				"entitlement %q is already paused (since %s)", entitlementID, ent.pausedAt.Format(time.RFC3339))
+		}
+	} else {
+		if ent.pausedAt == nil {
+			return PauseResumeEvent{}, false, fail(CodeEntitlementNotPaused,
+				"entitlement %q is not paused, so it cannot be resumed", entitlementID)
+		}
+		if !at.After(*ent.pausedAt) {
+			return PauseResumeEvent{}, false, fail(CodeInvalidRequest,
+				"resume time %s must be later than the pause time %s",
+				at.Format(time.RFC3339), ent.pausedAt.Format(time.RFC3339))
+		}
+	}
+
+	var created PauseResumeEvent
+	err = tx.QueryRow(ctx, `
+INSERT INTO pause_resume_events (entitlement_id, event_id, kind, at)
+VALUES ($1, $2, $3, $4)
+RETURNING event_id, kind, at, created_at`,
+		entitlementID, eventID, kind, at).
+		Scan(&created.ID, &created.Kind, &created.At, &created.CreatedAt)
+	if err != nil {
+		return PauseResumeEvent{}, false, fmt.Errorf("insert pause/resume event: %w", err)
+	}
+	if kind == KindPause {
+		if _, err := tx.Exec(ctx, `UPDATE entitlements SET paused_at = $1 WHERE entitlement_id = $2`,
+			at, entitlementID); err != nil {
+			return PauseResumeEvent{}, false, fmt.Errorf("stamp pause: %w", err)
+		}
+	} else {
+		if _, err := tx.Exec(ctx, `UPDATE entitlements SET paused_at = NULL WHERE entitlement_id = $1`,
+			entitlementID); err != nil {
+			return PauseResumeEvent{}, false, fmt.Errorf("clear pause: %w", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return PauseResumeEvent{}, false, fmt.Errorf("commit pause/resume event: %w", err)
+	}
+	return created, true, nil
+}
+
+// PauseEntitlement suspends grant issuance on an entitlement at the
+// caller-supplied time. While paused, new reservations are refused;
+// settlement and corrective reversal of in-flight reservations are
+// unaffected. No quota figure, seat figure or validity time changes.
+func (s *Store) PauseEntitlement(ctx context.Context, entitlementID, eventID string, at time.Time) (PauseResumeEvent, bool, error) {
+	return s.registerPauseResume(ctx, entitlementID, eventID, KindPause, at)
+}
+
+// ResumeEntitlement ends a pause previously registered with PauseEntitlement.
+// The resume time must be later than the matching pause time.
+func (s *Store) ResumeEntitlement(ctx context.Context, entitlementID, eventID string, at time.Time) (PauseResumeEvent, bool, error) {
+	return s.registerPauseResume(ctx, entitlementID, eventID, KindResume, at)
+}
+
 // GetView returns the quota breakdown, reservation list, adjustment list
 // and reschedule list for an entitlement, consistent with the committed
 // state. Due adjustments are folded into the quota total as part of the
@@ -987,6 +1330,11 @@ func (s *Store) GetView(ctx context.Context, entitlementID string) (View, error)
 	if err := applyDueAdjustments(ctx, tx, &ent, entitlementID); err != nil {
 		return View{}, err
 	}
+	// A view is itself a touch: the first read after the validity end closes
+	// the entitlement once, inside this read transaction.
+	if err := closeIfDue(ctx, tx, &ent, entitlementID); err != nil {
+		return View{}, err
+	}
 
 	var view View
 	view.EntitlementID = entitlementID
@@ -995,7 +1343,10 @@ func (s *Store) GetView(ctx context.Context, entitlementID string) (View, error)
 	view.UsedAmount = ent.usedAmount
 	view.ValidFrom = ent.validFrom
 	view.ValidTo = ent.validTo
+	view.ClosedAt = ent.closedAt
 	switch {
+	case ent.closedAt != nil:
+		view.Status = StatusClosed
 	case ent.now.Before(view.ValidFrom):
 		view.Status = "pending"
 	case ent.now.Before(view.ValidTo):
@@ -1098,6 +1449,44 @@ ORDER BY created_at, seat_adjustment_id`, entitlementID)
 	if err := seatAdjustmentRows.Err(); err != nil {
 		return View{}, fmt.Errorf("list seat adjustments: %w", err)
 	}
+
+	// The close-time accounting record exists exactly when closed.
+	if ent.closedAt != nil {
+		var snap ClosureSnapshot
+		if err := tx.QueryRow(ctx, `
+SELECT entitlement_id, seats_total, quota_total, used_amount, reserved_amount,
+       available_amount, valid_from, valid_to, closed_at
+FROM closure_snapshots WHERE entitlement_id = $1`, entitlementID).
+			Scan(&snap.EntitlementID, &snap.SeatsTotal, &snap.QuotaTotal, &snap.UsedAmount,
+				&snap.ReservedAmount, &snap.AvailableAmount, &snap.ValidFrom, &snap.ValidTo,
+				&snap.ClosedAt); err != nil {
+			return View{}, fmt.Errorf("load closure snapshot: %w", err)
+		}
+		view.ClosureSnapshot = &snap
+	}
+
+	eventRows, err := tx.Query(ctx, `
+SELECT event_id, kind, at, created_at
+FROM pause_resume_events WHERE entitlement_id = $1
+ORDER BY created_at, event_id`, entitlementID)
+	if err != nil {
+		return View{}, fmt.Errorf("list pause/resume events: %w", err)
+	}
+	view.PauseResume = []PauseResumeEvent{}
+	for eventRows.Next() {
+		var e PauseResumeEvent
+		if err := eventRows.Scan(&e.ID, &e.Kind, &e.At, &e.CreatedAt); err != nil {
+			eventRows.Close()
+			return View{}, fmt.Errorf("scan pause/resume event: %w", err)
+		}
+		view.PauseResume = append(view.PauseResume, e)
+	}
+	if err := eventRows.Err(); err != nil {
+		eventRows.Close()
+		return View{}, fmt.Errorf("list pause/resume events: %w", err)
+	}
+	eventRows.Close()
+
 	if err := tx.Commit(ctx); err != nil {
 		return View{}, fmt.Errorf("commit view: %w", err)
 	}
