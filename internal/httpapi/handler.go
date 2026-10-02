@@ -13,11 +13,12 @@ import (
 // Service is the entitlement domain surface the HTTP layer needs.
 type Service interface {
 	CreateEntitlement(ctx context.Context, in entitlements.CreateEntitlementInput) (entitlements.Entitlement, error)
-	CreateReservation(ctx context.Context, entitlementID, reservationID string, amount int64) (entitlements.Reservation, bool, error)
+	CreateReservation(ctx context.Context, entitlementID, reservationID, departmentID string, amount int64) (entitlements.Reservation, bool, error)
 	SettleReservation(ctx context.Context, entitlementID, reservationID, action string) (entitlements.Reservation, error)
 	ReverseReservation(ctx context.Context, entitlementID, reservationID, reversalID string) (entitlements.Reversal, bool, error)
 	CreateAdjustment(ctx context.Context, entitlementID, adjustmentID string, delta int64, effectiveAt time.Time) (entitlements.Adjustment, bool, error)
 	RescheduleEntitlement(ctx context.Context, entitlementID, rescheduleID string, newValidFrom, newValidTo time.Time) (entitlements.Reschedule, bool, error)
+	AdjustSeats(ctx context.Context, entitlementID, seatAdjustmentID string, delta int64) (entitlements.SeatAdjustment, bool, error)
 	GetView(ctx context.Context, entitlementID string) (entitlements.View, error)
 }
 
@@ -45,6 +46,7 @@ func New(checkDatabase func(context.Context) error, service Service) http.Handle
 	mux.HandleFunc("POST /entitlements/{entitlementID}/reservations/{reservationID}/reverse", h.reverseReservation)
 	mux.HandleFunc("POST /entitlements/{entitlementID}/adjustments", h.createAdjustment)
 	mux.HandleFunc("POST /entitlements/{entitlementID}/reschedules", h.createReschedule)
+	mux.HandleFunc("POST /entitlements/{entitlementID}/seat-adjustments", h.adjustSeats)
 	return mux
 }
 
@@ -90,6 +92,7 @@ func (h *handlers) createEntitlement(w http.ResponseWriter, r *http.Request) {
 
 type createReservationRequest struct {
 	ReservationID string `json:"reservation_id"`
+	DepartmentID  string `json:"department_id"`
 	Amount        *int64 `json:"amount"`
 }
 
@@ -106,7 +109,7 @@ func (h *handlers) createReservation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	reservation, created, err := h.service.CreateReservation(
-		r.Context(), r.PathValue("entitlementID"), req.ReservationID, *req.Amount)
+		r.Context(), r.PathValue("entitlementID"), req.ReservationID, req.DepartmentID, *req.Amount)
 	if err != nil {
 		respondError(w, err)
 		return
@@ -240,6 +243,36 @@ func (h *handlers) getEntitlement(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, http.StatusOK, view)
 }
 
+type adjustSeatsRequest struct {
+	SeatAdjustmentID string `json:"seat_adjustment_id"`
+	Delta            *int64 `json:"delta"`
+}
+
+func (h *handlers) adjustSeats(w http.ResponseWriter, r *http.Request) {
+	var req adjustSeatsRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	if req.Delta == nil || *req.Delta == 0 {
+		respondError(w, &entitlements.Error{
+			Code:    entitlements.CodeInvalidRequest,
+			Message: "delta is required and must be a non-zero integer",
+		})
+		return
+	}
+	adjustment, created, err := h.service.AdjustSeats(
+		r.Context(), r.PathValue("entitlementID"), req.SeatAdjustmentID, *req.Delta)
+	if err != nil {
+		respondError(w, err)
+		return
+	}
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	respondJSON(w, status, adjustment)
+}
+
 // decode parses a JSON request body strictly; on failure it writes the error
 // response and returns false.
 func decode(w http.ResponseWriter, r *http.Request, target any) bool {
@@ -269,6 +302,7 @@ var errorStatus = map[string]int{
 	entitlements.CodeReservationReversed:     http.StatusConflict,
 	entitlements.CodeAdjustmentParamChanged:  http.StatusConflict,
 	entitlements.CodeRescheduleParamChanged:  http.StatusConflict,
+	entitlements.CodeSeatAdjustmentChanged:   http.StatusConflict,
 }
 
 func respondError(w http.ResponseWriter, err error) {

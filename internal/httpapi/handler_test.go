@@ -47,26 +47,30 @@ func TestHealthAndReadiness(t *testing.T) {
 
 // fakeService records calls and returns scripted results.
 type fakeService struct {
-	entitlement  entitlements.Entitlement
-	reservation  entitlements.Reservation
-	reversal     entitlements.Reversal
-	adjustment   entitlements.Adjustment
-	reschedule   entitlements.Reschedule
-	created      bool
-	view         entitlements.View
-	err          error
-	settleAction string
-	reversalID   string
-	adjustmentID string
-	delta        int64
-	rescheduleID string
+	entitlement      entitlements.Entitlement
+	reservation      entitlements.Reservation
+	reversal         entitlements.Reversal
+	adjustment       entitlements.Adjustment
+	reschedule       entitlements.Reschedule
+	seatAdjustment   entitlements.SeatAdjustment
+	created          bool
+	view             entitlements.View
+	err              error
+	settleAction     string
+	reversalID       string
+	adjustmentID     string
+	delta            int64
+	rescheduleID     string
+	departmentID     string
+	seatAdjustmentID string
 }
 
 func (f *fakeService) CreateEntitlement(_ context.Context, _ entitlements.CreateEntitlementInput) (entitlements.Entitlement, error) {
 	return f.entitlement, f.err
 }
 
-func (f *fakeService) CreateReservation(_ context.Context, _, _ string, _ int64) (entitlements.Reservation, bool, error) {
+func (f *fakeService) CreateReservation(_ context.Context, _, _, departmentID string, _ int64) (entitlements.Reservation, bool, error) {
+	f.departmentID = departmentID
 	return f.reservation, f.created, f.err
 }
 
@@ -89,6 +93,12 @@ func (f *fakeService) CreateAdjustment(_ context.Context, _, adjustmentID string
 func (f *fakeService) RescheduleEntitlement(_ context.Context, _, rescheduleID string, _, _ time.Time) (entitlements.Reschedule, bool, error) {
 	f.rescheduleID = rescheduleID
 	return f.reschedule, f.created, f.err
+}
+
+func (f *fakeService) AdjustSeats(_ context.Context, _, seatAdjustmentID string, delta int64) (entitlements.SeatAdjustment, bool, error) {
+	f.seatAdjustmentID = seatAdjustmentID
+	f.delta = delta
+	return f.seatAdjustment, f.created, f.err
 }
 
 func (f *fakeService) GetView(_ context.Context, _ string) (entitlements.View, error) {
@@ -142,6 +152,7 @@ func TestErrorMapping(t *testing.T) {
 		{"already reversed", entitlements.CodeReservationReversed, 409},
 		{"adjustment param mismatch", entitlements.CodeAdjustmentParamChanged, 409},
 		{"reschedule param mismatch", entitlements.CodeRescheduleParamChanged, 409},
+		{"seat adjustment param mismatch", entitlements.CodeSeatAdjustmentChanged, 409},
 		{"internal", "unmapped", 500},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -161,14 +172,18 @@ func TestErrorMapping(t *testing.T) {
 }
 
 func TestReservationReplayStatus(t *testing.T) {
-	reservation := entitlements.Reservation{ReservationID: "r1", Amount: 5, Status: "pending", CreatedAt: time.Now()}
-	created := serve(t, &fakeService{reservation: reservation, created: true},
-		"POST", "/entitlements/ent-1/reservations", `{"reservation_id":"r1","amount":5}`)
-	if created.Code != 201 {
-		t.Fatalf("new reservation: status=%d body=%q", created.Code, created.Body.String())
+	department := "dept-a"
+	reservation := entitlements.Reservation{ReservationID: "r1", DepartmentID: &department, Amount: 5, Status: "pending", CreatedAt: time.Now()}
+	service := &fakeService{reservation: reservation, created: true}
+	created := serve(t, service, "POST", "/entitlements/ent-1/reservations", `{"reservation_id":"r1","department_id":"dept-a","amount":5}`)
+	if created.Code != 201 || service.departmentID != "dept-a" {
+		t.Fatalf("new reservation: status=%d department_id=%q body=%q", created.Code, service.departmentID, created.Body.String())
 	}
-	replayed := serve(t, &fakeService{reservation: reservation, created: false},
-		"POST", "/entitlements/ent-1/reservations", `{"reservation_id":"r1","amount":5}`)
+	if !strings.Contains(created.Body.String(), `"department_id":"dept-a"`) {
+		t.Fatalf("reservation body: %q", created.Body.String())
+	}
+	service.created = false
+	replayed := serve(t, service, "POST", "/entitlements/ent-1/reservations", `{"reservation_id":"r1","department_id":"dept-a","amount":5}`)
 	if replayed.Code != 200 {
 		t.Fatalf("replayed reservation: status=%d body=%q", replayed.Code, replayed.Body.String())
 	}
@@ -306,6 +321,54 @@ func TestRescheduleRoute(t *testing.T) {
 		`{"new_valid_from":"2026-02-01T00:00:00Z","new_valid_to":"2027-02-01T00:00:00Z"}`)
 	if response.Code != 400 || !strings.Contains(response.Body.String(), `"invalid_request"`) {
 		t.Fatalf("missing reschedule_id: status=%d body=%q", response.Code, response.Body.String())
+	}
+}
+
+func TestSeatAdjustmentRoute(t *testing.T) {
+	seatAdjustment := entitlements.SeatAdjustment{
+		SeatAdjustmentID: "seat-1", Delta: 20, SeatsTotal: 120, CreatedAt: time.Now(),
+	}
+	service := &fakeService{seatAdjustment: seatAdjustment, created: true}
+	created := serve(t, service, "POST", "/entitlements/ent-1/seat-adjustments",
+		`{"seat_adjustment_id":"seat-1","delta":20}`)
+	if created.Code != 201 || service.seatAdjustmentID != "seat-1" || service.delta != 20 {
+		t.Fatalf("new seat adjustment: status=%d seat_adjustment_id=%q delta=%d body=%q",
+			created.Code, service.seatAdjustmentID, service.delta, created.Body.String())
+	}
+	if !strings.Contains(created.Body.String(), `"seat_adjustment_id":"seat-1"`) ||
+		!strings.Contains(created.Body.String(), `"seats_total":120`) {
+		t.Fatalf("seat adjustment body: %q", created.Body.String())
+	}
+	service.created = false
+	replayed := serve(t, service, "POST", "/entitlements/ent-1/seat-adjustments",
+		`{"seat_adjustment_id":"seat-1","delta":20}`)
+	if replayed.Code != 200 {
+		t.Fatalf("replayed seat adjustment: status=%d body=%q", replayed.Code, replayed.Body.String())
+	}
+	// A missing or zero delta, unknown fields and malformed JSON are rejected
+	// before the domain is called.
+	for _, body := range []string{
+		`{"seat_adjustment_id":"seat-1"}`,
+		`{"seat_adjustment_id":"seat-1","delta":0}`,
+		`{"seat_adjustment_id":"seat-1","delta":20,"effective_at":"2026-06-01T00:00:00Z"}`,
+		`{`,
+	} {
+		response := serve(t, service, "POST", "/entitlements/ent-1/seat-adjustments", body)
+		if response.Code != 400 || !strings.Contains(response.Body.String(), `"invalid_request"`) {
+			t.Fatalf("body %q: status=%d body=%q", body, response.Code, response.Body.String())
+		}
+	}
+	// A missing seat_adjustment_id and a missing or invalid department_id
+	// reach the domain, which rejects them.
+	invalid := &fakeService{err: &entitlements.Error{Code: entitlements.CodeInvalidRequest, Message: "bad identifier"}}
+	response := serve(t, invalid, "POST", "/entitlements/ent-1/seat-adjustments", `{"delta":20}`)
+	if response.Code != 400 || !strings.Contains(response.Body.String(), `"invalid_request"`) {
+		t.Fatalf("missing seat_adjustment_id: status=%d body=%q", response.Code, response.Body.String())
+	}
+	response = serve(t, invalid, "POST", "/entitlements/ent-1/reservations",
+		`{"reservation_id":"r1","amount":5}`)
+	if response.Code != 400 || !strings.Contains(response.Body.String(), `"invalid_request"`) {
+		t.Fatalf("missing department_id: status=%d body=%q", response.Code, response.Body.String())
 	}
 }
 

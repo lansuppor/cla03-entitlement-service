@@ -1,8 +1,9 @@
 // Package entitlements implements the seat-quota entitlement domain:
 // entitlement creation, idempotent reservations, confirm/release
 // settlement, corrective reversals of confirmed reservations, scheduled
-// quota-total adjustments, and rescheduling of the validity window,
-// persisted in PostgreSQL.
+// quota-total adjustments, rescheduling of the validity window, and
+// immediate seat-total adjustments used to allocate seats to internal
+// departments and reclaim them, persisted in PostgreSQL.
 package entitlements
 
 import (
@@ -32,6 +33,7 @@ const (
 	CodeReservationReversed     = "reservation_already_reversed"
 	CodeAdjustmentParamChanged  = "adjustment_param_mismatch"
 	CodeRescheduleParamChanged  = "reschedule_param_mismatch"
+	CodeSeatAdjustmentChanged   = "seat_adjustment_param_mismatch"
 )
 
 // Error is a domain failure with a stable machine-readable code.
@@ -71,9 +73,13 @@ type Entitlement struct {
 	ValidTo       time.Time `json:"valid_to"`
 }
 
-// Reservation is a quota hold placed by an internal sub-team.
+// Reservation is a quota hold placed by an internal sub-team. DepartmentID is
+// the owning internal department supplied at creation and immutable after
+// that; it is nil only for entries in the view that describe corrective
+// reversals rather than reservations.
 type Reservation struct {
 	ReservationID string     `json:"reservation_id"`
+	DepartmentID  *string    `json:"department_id,omitempty"`
 	Amount        int64      `json:"amount"`
 	Status        string     `json:"status"`
 	SettledAt     *time.Time `json:"settled_at,omitempty"`
@@ -123,6 +129,21 @@ type Reschedule struct {
 	CreatedAt    time.Time `json:"created_at"`
 }
 
+// SeatAdjustment is a caller-initiated immediate change of the seat total,
+// identified by the caller-supplied seat adjustment identifier, unique
+// within the entitlement. Delta is a non-zero integer: positive grows the
+// seat total, negative shrinks it. The change takes effect at once — there
+// is no effective time. A decrease is rejected when it would drop the seat
+// total to zero or below, or below the seats already allocated to internal
+// departments (confirmed reservations plus unsettled holds). SeatsTotal is
+// the running total after this adjustment, accumulated in creation order.
+type SeatAdjustment struct {
+	SeatAdjustmentID string    `json:"seat_adjustment_id"`
+	Delta            int64     `json:"delta"`
+	SeatsTotal       int64     `json:"seats_total"`
+	CreatedAt        time.Time `json:"created_at"`
+}
+
 // adjustmentStatus derives the lifecycle state from the application
 // timestamp.
 func adjustmentStatus(appliedAt *time.Time) string {
@@ -140,19 +161,22 @@ func adjustmentStatus(appliedAt *time.Time) string {
 // folded into QuotaTotal; the quota figures only reflect applied adjustments.
 // Reschedules lists every validity-window rewrite in creation order; the
 // reported ValidFrom/ValidTo and Status always reflect the latest one.
+// SeatAdjustments lists every immediate seat-total adjustment in creation
+// order, each with its cumulative running seat total.
 type View struct {
-	EntitlementID   string        `json:"entitlement_id"`
-	SeatsTotal      int64         `json:"seats_total"`
-	QuotaTotal      int64         `json:"quota_total"`
-	UsedAmount      int64         `json:"used_amount"`
-	ReservedAmount  int64         `json:"reserved_amount"`
-	AvailableAmount int64         `json:"available_amount"`
-	Status          string        `json:"status"` // pending, active or expired
-	ValidFrom       time.Time     `json:"valid_from"`
-	ValidTo         time.Time     `json:"valid_to"`
-	Reservations    []Reservation `json:"reservations"`
-	Adjustments     []Adjustment  `json:"adjustments"`
-	Reschedules     []Reschedule  `json:"reschedules"`
+	EntitlementID   string           `json:"entitlement_id"`
+	SeatsTotal      int64            `json:"seats_total"`
+	QuotaTotal      int64            `json:"quota_total"`
+	UsedAmount      int64            `json:"used_amount"`
+	ReservedAmount  int64            `json:"reserved_amount"`
+	AvailableAmount int64            `json:"available_amount"`
+	Status          string           `json:"status"` // pending, active or expired
+	ValidFrom       time.Time        `json:"valid_from"`
+	ValidTo         time.Time        `json:"valid_to"`
+	Reservations    []Reservation    `json:"reservations"`
+	Adjustments     []Adjustment     `json:"adjustments"`
+	Reschedules     []Reschedule     `json:"reschedules"`
+	SeatAdjustments []SeatAdjustment `json:"seat_adjustments"`
 }
 
 var identifierPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
@@ -188,6 +212,7 @@ CREATE TABLE IF NOT EXISTS entitlements (
 CREATE TABLE IF NOT EXISTS reservations (
     entitlement_id TEXT NOT NULL REFERENCES entitlements (entitlement_id),
     reservation_id TEXT NOT NULL,
+    department_id  TEXT NOT NULL DEFAULT '',
     amount         BIGINT NOT NULL CHECK (amount > 0),
     status         TEXT NOT NULL DEFAULT 'pending'
                    CHECK (status IN ('pending', 'confirmed', 'released')),
@@ -195,6 +220,9 @@ CREATE TABLE IF NOT EXISTS reservations (
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (entitlement_id, reservation_id)
 );
+-- Databases initialized by an older schema may already have a reservations
+-- table without the owning-department marker.
+ALTER TABLE reservations ADD COLUMN IF NOT EXISTS department_id TEXT NOT NULL DEFAULT '';
 CREATE TABLE IF NOT EXISTS reversals (
     entitlement_id TEXT NOT NULL REFERENCES entitlements (entitlement_id),
     reversal_id    TEXT NOT NULL,
@@ -225,6 +253,14 @@ CREATE TABLE IF NOT EXISTS reschedules (
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (entitlement_id, reschedule_id),
     CHECK (new_valid_from < new_valid_to)
+);
+CREATE TABLE IF NOT EXISTS seat_adjustments (
+    entitlement_id      TEXT NOT NULL REFERENCES entitlements (entitlement_id),
+    seat_adjustment_id  TEXT NOT NULL,
+    delta               BIGINT NOT NULL CHECK (delta <> 0),
+    seats_total         BIGINT NOT NULL CHECK (seats_total > 0),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (entitlement_id, seat_adjustment_id)
 );`)
 	if err != nil {
 		return fmt.Errorf("migrate schema: %w", err)
@@ -388,11 +424,16 @@ UPDATE entitlements SET quota_total = quota_total + $1 WHERE entitlement_id = $2
 }
 
 // CreateReservation places a quota hold. The caller-supplied reservationID is
-// unique per entitlement: resubmitting it with the same amount returns the
-// original reservation without consuming quota again (created=false);
-// resubmitting it with a different amount fails without changing state.
-func (s *Store) CreateReservation(ctx context.Context, entitlementID, reservationID string, amount int64) (Reservation, bool, error) {
+// unique per entitlement: resubmitting it with the same amount and owning
+// department returns the original reservation without consuming quota again
+// (created=false); resubmitting it with a different amount or department
+// fails without changing state. departmentID is the owning internal
+// department, supplied at creation and immutable afterwards.
+func (s *Store) CreateReservation(ctx context.Context, entitlementID, reservationID, departmentID string, amount int64) (Reservation, bool, error) {
 	if err := validIdentifier("reservation_id", reservationID); err != nil {
+		return Reservation{}, false, err
+	}
+	if err := validIdentifier("department_id", departmentID); err != nil {
 		return Reservation{}, false, err
 	}
 	if amount <= 0 {
@@ -414,17 +455,18 @@ func (s *Store) CreateReservation(ctx context.Context, entitlementID, reservatio
 
 	var existing Reservation
 	err = tx.QueryRow(ctx, `
-SELECT reservation_id, amount, status, settled_at, created_at
+SELECT reservation_id, NULLIF(department_id, ''), amount, status, settled_at, created_at
 FROM reservations WHERE entitlement_id = $1 AND reservation_id = $2`,
 		entitlementID, reservationID).
-		Scan(&existing.ReservationID, &existing.Amount, &existing.Status, &existing.SettledAt, &existing.CreatedAt)
+		Scan(&existing.ReservationID, &existing.DepartmentID, &existing.Amount, &existing.Status, &existing.SettledAt, &existing.CreatedAt)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return Reservation{}, false, fmt.Errorf("load reservation: %w", err)
 	}
 	if err == nil {
-		if existing.Amount != amount {
+		if existing.Amount != amount || existing.DepartmentID == nil || *existing.DepartmentID != departmentID {
 			return Reservation{}, false, fail(CodeReservationParamChanged,
-				"reservation %q already exists with amount %d, not %d", reservationID, existing.Amount, amount)
+				"reservation %q already exists with amount %d and department %q, not amount %d and department %q",
+				reservationID, existing.Amount, derefDepartment(existing.DepartmentID), amount, departmentID)
 		}
 		return existing, false, tx.Commit(ctx)
 	}
@@ -443,11 +485,11 @@ FROM reservations WHERE entitlement_id = $1 AND reservation_id = $2`,
 	}
 	var created Reservation
 	err = tx.QueryRow(ctx, `
-INSERT INTO reservations (entitlement_id, reservation_id, amount)
-VALUES ($1, $2, $3)
-RETURNING reservation_id, amount, status, settled_at, created_at`,
-		entitlementID, reservationID, amount).
-		Scan(&created.ReservationID, &created.Amount, &created.Status, &created.SettledAt, &created.CreatedAt)
+INSERT INTO reservations (entitlement_id, reservation_id, department_id, amount)
+VALUES ($1, $2, $3, $4)
+RETURNING reservation_id, NULLIF(department_id, ''), amount, status, settled_at, created_at`,
+		entitlementID, reservationID, departmentID, amount).
+		Scan(&created.ReservationID, &created.DepartmentID, &created.Amount, &created.Status, &created.SettledAt, &created.CreatedAt)
 	if err != nil {
 		return Reservation{}, false, fmt.Errorf("insert reservation: %w", err)
 	}
@@ -455,6 +497,14 @@ RETURNING reservation_id, amount, status, settled_at, created_at`,
 		return Reservation{}, false, fmt.Errorf("commit reservation: %w", err)
 	}
 	return created, true, nil
+}
+
+// derefDepartment renders a possibly absent department for error messages.
+func derefDepartment(department *string) string {
+	if department == nil {
+		return ""
+	}
+	return *department
 }
 
 // SettleReservation settles a pending reservation exactly once: confirm moves
@@ -479,10 +529,10 @@ func (s *Store) SettleReservation(ctx context.Context, entitlementID, reservatio
 	}
 	var reservation Reservation
 	err = tx.QueryRow(ctx, `
-SELECT reservation_id, amount, status, settled_at, created_at
+SELECT reservation_id, NULLIF(department_id, ''), amount, status, settled_at, created_at
 FROM reservations WHERE entitlement_id = $1 AND reservation_id = $2`,
 		entitlementID, reservationID).
-		Scan(&reservation.ReservationID, &reservation.Amount, &reservation.Status, &reservation.SettledAt, &reservation.CreatedAt)
+		Scan(&reservation.ReservationID, &reservation.DepartmentID, &reservation.Amount, &reservation.Status, &reservation.SettledAt, &reservation.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Reservation{}, fail(CodeReservationNotFound,
 			"reservation %q does not exist on entitlement %q", reservationID, entitlementID)
@@ -508,9 +558,9 @@ UPDATE entitlements SET used_amount = used_amount + $1 WHERE entitlement_id = $2
 	err = tx.QueryRow(ctx, `
 UPDATE reservations SET status = $1, settled_at = now()
 WHERE entitlement_id = $2 AND reservation_id = $3
-RETURNING reservation_id, amount, status, settled_at, created_at`,
+RETURNING reservation_id, NULLIF(department_id, ''), amount, status, settled_at, created_at`,
 		newStatus, entitlementID, reservationID).
-		Scan(&reservation.ReservationID, &reservation.Amount, &reservation.Status, &reservation.SettledAt, &reservation.CreatedAt)
+		Scan(&reservation.ReservationID, &reservation.DepartmentID, &reservation.Amount, &reservation.Status, &reservation.SettledAt, &reservation.CreatedAt)
 	if err != nil {
 		return Reservation{}, fmt.Errorf("settle reservation: %w", err)
 	}
@@ -799,11 +849,102 @@ UPDATE entitlements SET valid_from = $1, valid_to = $2 WHERE entitlement_id = $3
 	return created, true, nil
 }
 
-// GetView returns the quota breakdown, reservation list, adjustment list
-// and reschedule list for an entitlement, consistent with the committed
-// state. Due adjustments are folded into the quota total as part of the
-// read, under the same row lock as the mutating flows, so the reported
-// figures always reflect every adjustment whose effective time has
+// AdjustSeats immediately changes an entitlement's seat total. The
+// caller-supplied seatAdjustmentID is unique per entitlement: the first
+// submission records the seat adjustment and moves the seat total at once
+// (created=true); resubmitting the same identifier with the same delta
+// returns the original seat adjustment without moving the seat total again
+// (created=false); resubmitting it with a different delta fails without
+// changing state. There is no effective time — the change always takes
+// effect immediately and never touches any quota figure. A decrease is
+// rejected (and writes nothing) when it would drop the seat total to zero or
+// below, or below the seats already allocated to internal departments —
+// confirmed reservations plus unsettled holds. The whole flow runs under the
+// per-entitlement row lock, so it serializes with reservations,
+// settlements, reversals, quota adjustments and reschedules, replays never
+// move the seat total twice, and failures leave no partial state.
+func (s *Store) AdjustSeats(ctx context.Context, entitlementID, seatAdjustmentID string, delta int64) (SeatAdjustment, bool, error) {
+	if err := validIdentifier("seat_adjustment_id", seatAdjustmentID); err != nil {
+		return SeatAdjustment{}, false, err
+	}
+	if delta == 0 {
+		return SeatAdjustment{}, false, fail(CodeInvalidRequest, "delta is required and must be a non-zero integer")
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return SeatAdjustment{}, false, fmt.Errorf("begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	ent, err := lockEntitlement(ctx, tx, entitlementID)
+	if err != nil {
+		return SeatAdjustment{}, false, err
+	}
+
+	var existing SeatAdjustment
+	err = tx.QueryRow(ctx, `
+SELECT seat_adjustment_id, delta, seats_total, created_at
+FROM seat_adjustments WHERE entitlement_id = $1 AND seat_adjustment_id = $2`,
+		entitlementID, seatAdjustmentID).
+		Scan(&existing.SeatAdjustmentID, &existing.Delta, &existing.SeatsTotal, &existing.CreatedAt)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return SeatAdjustment{}, false, fmt.Errorf("load seat adjustment: %w", err)
+	}
+	if err == nil {
+		if existing.Delta != delta {
+			return SeatAdjustment{}, false, fail(CodeSeatAdjustmentChanged,
+				"seat adjustment %q already exists with delta %d, not %d", seatAdjustmentID, existing.Delta, delta)
+		}
+		return existing, false, tx.Commit(ctx)
+	}
+
+	newTotal := ent.seatsTotal + delta
+	// Guard against int64 overflow instead of failing deep in PostgreSQL.
+	if (delta > 0 && newTotal < ent.seatsTotal) || (delta < 0 && newTotal > ent.seatsTotal) {
+		return SeatAdjustment{}, false, fail(CodeInvalidRequest, "delta %d is too large to apply to a seat total of %d", delta, ent.seatsTotal)
+	}
+	if delta < 0 {
+		if newTotal <= 0 {
+			return SeatAdjustment{}, false, fail(CodeInsufficientQuota,
+				"decrease of %d would drop the seat total of %d to zero or below", -delta, ent.seatsTotal)
+		}
+		pending, err := pendingAmount(ctx, tx, entitlementID)
+		if err != nil {
+			return SeatAdjustment{}, false, err
+		}
+		if occupied := ent.usedAmount + pending; occupied > newTotal {
+			return SeatAdjustment{}, false, fail(CodeInsufficientQuota,
+				"decrease of %d would drop the seat total of %d below the %d seats already allocated to departments",
+				-delta, ent.seatsTotal, occupied)
+		}
+	}
+
+	var created SeatAdjustment
+	err = tx.QueryRow(ctx, `
+INSERT INTO seat_adjustments (entitlement_id, seat_adjustment_id, delta, seats_total)
+VALUES ($1, $2, $3, $4)
+RETURNING seat_adjustment_id, delta, seats_total, created_at`,
+		entitlementID, seatAdjustmentID, delta, newTotal).
+		Scan(&created.SeatAdjustmentID, &created.Delta, &created.SeatsTotal, &created.CreatedAt)
+	if err != nil {
+		return SeatAdjustment{}, false, fmt.Errorf("insert seat adjustment: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+UPDATE entitlements SET seats_total = $1 WHERE entitlement_id = $2`,
+		newTotal, entitlementID); err != nil {
+		return SeatAdjustment{}, false, fmt.Errorf("adjust seat total: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return SeatAdjustment{}, false, fmt.Errorf("commit seat adjustment: %w", err)
+	}
+	return created, true, nil
+}
+
+// GetView returns the quota breakdown, reservation list, adjustment list,
+// reschedule list and seat adjustment list for an entitlement, consistent
+// with the committed state. Due adjustments are folded into the quota total
+// as part of the read, under the same row lock as the mutating flows, so the
+// reported figures always reflect every adjustment whose effective time has
 // arrived — applied exactly once, even across restarts.
 func (s *Store) GetView(ctx context.Context, entitlementID string) (View, error) {
 	tx, err := s.pool.Begin(ctx)
@@ -842,12 +983,12 @@ func (s *Store) GetView(ctx context.Context, entitlementID string) (View, error)
 	view.AvailableAmount = view.QuotaTotal - view.UsedAmount - view.ReservedAmount
 
 	rows, err := tx.Query(ctx, `
-SELECT reservation_id, amount, status, settled_at, created_at
+SELECT reservation_id, department, amount, status, settled_at, created_at
 FROM (
-    SELECT reservation_id, amount, status, settled_at, created_at
+    SELECT reservation_id, NULLIF(department_id, '') AS department, amount, status, settled_at, created_at
     FROM reservations WHERE entitlement_id = $1
     UNION ALL
-    SELECT reversal_id, amount, 'reversed', settled_at, created_at
+    SELECT reversal_id, NULL, amount, 'reversed', settled_at, created_at
     FROM reversals WHERE entitlement_id = $1
 ) AS entries
 ORDER BY created_at, reservation_id`, entitlementID)
@@ -858,7 +999,7 @@ ORDER BY created_at, reservation_id`, entitlementID)
 	view.Reservations = []Reservation{}
 	for rows.Next() {
 		var r Reservation
-		if err := rows.Scan(&r.ReservationID, &r.Amount, &r.Status, &r.SettledAt, &r.CreatedAt); err != nil {
+		if err := rows.Scan(&r.ReservationID, &r.DepartmentID, &r.Amount, &r.Status, &r.SettledAt, &r.CreatedAt); err != nil {
 			return View{}, fmt.Errorf("scan reservation: %w", err)
 		}
 		view.Reservations = append(view.Reservations, r)
@@ -908,6 +1049,27 @@ ORDER BY created_at, reschedule_id`, entitlementID)
 	}
 	if err := rescheduleRows.Err(); err != nil {
 		return View{}, fmt.Errorf("list reschedules: %w", err)
+	}
+	rescheduleRows.Close()
+
+	seatRows, err := tx.Query(ctx, `
+SELECT seat_adjustment_id, delta, seats_total, created_at
+FROM seat_adjustments WHERE entitlement_id = $1
+ORDER BY created_at, seat_adjustment_id`, entitlementID)
+	if err != nil {
+		return View{}, fmt.Errorf("list seat adjustments: %w", err)
+	}
+	defer seatRows.Close()
+	view.SeatAdjustments = []SeatAdjustment{}
+	for seatRows.Next() {
+		var sa SeatAdjustment
+		if err := seatRows.Scan(&sa.SeatAdjustmentID, &sa.Delta, &sa.SeatsTotal, &sa.CreatedAt); err != nil {
+			return View{}, fmt.Errorf("scan seat adjustment: %w", err)
+		}
+		view.SeatAdjustments = append(view.SeatAdjustments, sa)
+	}
+	if err := seatRows.Err(); err != nil {
+		return View{}, fmt.Errorf("list seat adjustments: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return View{}, fmt.Errorf("commit view: %w", err)
