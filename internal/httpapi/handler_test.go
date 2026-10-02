@@ -53,6 +53,7 @@ type fakeService struct {
 	adjustment     entitlements.Adjustment
 	reschedule     entitlements.Reschedule
 	seatAdjustment entitlements.SeatAdjustment
+	pauseResume    entitlements.PauseResumeRecord
 	created        bool
 	view           entitlements.View
 	err            error
@@ -62,6 +63,8 @@ type fakeService struct {
 	delta          int64
 	rescheduleID   string
 	departmentID   string
+	pauseResumeID  string
+	pauseResumeAt  time.Time
 }
 
 func (f *fakeService) CreateEntitlement(_ context.Context, _ entitlements.CreateEntitlementInput) (entitlements.Entitlement, error) {
@@ -98,6 +101,18 @@ func (f *fakeService) CreateSeatAdjustment(_ context.Context, _, seatAdjustmentI
 	f.adjustmentID = seatAdjustmentID
 	f.delta = delta
 	return f.seatAdjustment, f.created, f.err
+}
+
+func (f *fakeService) PauseEntitlement(_ context.Context, _, businessID string, at time.Time) (entitlements.PauseResumeRecord, bool, error) {
+	f.pauseResumeID = businessID
+	f.pauseResumeAt = at
+	return f.pauseResume, f.created, f.err
+}
+
+func (f *fakeService) ResumeEntitlement(_ context.Context, _, businessID string, at time.Time) (entitlements.PauseResumeRecord, bool, error) {
+	f.pauseResumeID = businessID
+	f.pauseResumeAt = at
+	return f.pauseResume, f.created, f.err
 }
 
 func (f *fakeService) GetView(_ context.Context, _ string) (entitlements.View, error) {
@@ -152,6 +167,10 @@ func TestErrorMapping(t *testing.T) {
 		{"adjustment param mismatch", entitlements.CodeAdjustmentParamChanged, 409},
 		{"reschedule param mismatch", entitlements.CodeRescheduleParamChanged, 409},
 		{"seat adjustment param mismatch", entitlements.CodeSeatAdjustmentChanged, 409},
+		{"entitlement closed", entitlements.CodeEntitlementClosed, 409},
+		{"entitlement paused", entitlements.CodeEntitlementPaused, 409},
+		{"pause/resume param mismatch", entitlements.CodePauseResumeParamChanged, 409},
+		{"pause/resume conflict", entitlements.CodePauseResumeConflict, 409},
 		{"internal", "unmapped", 500},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -402,6 +421,74 @@ func TestRescheduleRoute(t *testing.T) {
 		`{"new_valid_from":"2026-02-01T00:00:00Z","new_valid_to":"2027-02-01T00:00:00Z"}`)
 	if response.Code != 400 || !strings.Contains(response.Body.String(), `"invalid_request"`) {
 		t.Fatalf("missing reschedule_id: status=%d body=%q", response.Code, response.Body.String())
+	}
+}
+
+func TestPauseResumeRoutes(t *testing.T) {
+	record := entitlements.PauseResumeRecord{
+		BusinessID: "hold-1", Type: entitlements.ActionPause,
+		At:        time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC),
+		CreatedAt: time.Now(),
+	}
+	service := &fakeService{pauseResume: record, created: true}
+	paused := serve(t, service, "POST", "/entitlements/ent-1/pauses",
+		`{"business_id":"hold-1","at":"2026-06-01T00:00:00Z"}`)
+	if paused.Code != 201 || service.pauseResumeID != "hold-1" ||
+		service.pauseResumeAt != record.At {
+		t.Fatalf("pause: status=%d id=%q at=%v body=%q",
+			paused.Code, service.pauseResumeID, service.pauseResumeAt, paused.Body.String())
+	}
+	if !strings.Contains(paused.Body.String(), `"business_id":"hold-1"`) ||
+		!strings.Contains(paused.Body.String(), `"type":"pause"`) {
+		t.Fatalf("pause body: %q", paused.Body.String())
+	}
+
+	record.Type = entitlements.ActionResume
+	service.pauseResume = record
+	service.created = false
+	resumed := serve(t, service, "POST", "/entitlements/ent-1/resumes",
+		`{"business_id":"back-1","at":"2026-06-02T00:00:00Z"}`)
+	if resumed.Code != 200 {
+		t.Fatalf("replayed resume: status=%d body=%q", resumed.Code, resumed.Body.String())
+	}
+	if !strings.Contains(resumed.Body.String(), `"type":"resume"`) {
+		t.Fatalf("resume body: %q", resumed.Body.String())
+	}
+
+	// A missing or malformed at, unknown fields and malformed JSON are
+	// rejected before the domain is called; a missing business_id reaches it.
+	for _, tc := range []struct {
+		path, body string
+	}{
+		{"/entitlements/ent-1/pauses", `{"business_id":"hold-1"}`},
+		{"/entitlements/ent-1/pauses", `{"business_id":"hold-1","at":"soon"}`},
+		{"/entitlements/ent-1/resumes", `{"business_id":"back-1","at":5}`},
+		{"/entitlements/ent-1/resumes", `{"business_id":"back-1","at":"2026-06-02T00:00:00Z","x":1}`},
+		{"/entitlements/ent-1/pauses", `{`},
+	} {
+		response := serve(t, service, "POST", tc.path, tc.body)
+		if response.Code != 400 || !strings.Contains(response.Body.String(), `"invalid_request"`) {
+			t.Fatalf("body %q: status=%d body=%q", tc.body, response.Code, response.Body.String())
+		}
+	}
+	// Domain failures keep their stable status and envelope.
+	for _, tc := range []struct {
+		code string
+		want int
+	}{
+		{entitlements.CodeEntitlementNotFound, 404},
+		{entitlements.CodeEntitlementClosed, 409},
+		{entitlements.CodeEntitlementPaused, 409},
+		{entitlements.CodePauseResumeParamChanged, 409},
+		{entitlements.CodePauseResumeConflict, 409},
+		{entitlements.CodeInvalidRequest, 400},
+	} {
+		failing := &fakeService{err: &entitlements.Error{Code: tc.code, Message: "boom"}}
+		response := serve(t, failing, "POST", "/entitlements/ent-1/pauses",
+			`{"business_id":"hold-1","at":"2026-06-01T00:00:00Z"}`)
+		if response.Code != tc.want || !strings.Contains(response.Body.String(), `"`+tc.code+`"`) {
+			t.Fatalf("code %q: status=%d body=%q", tc.code, response.Code, response.Body.String())
+		}
 	}
 }
 

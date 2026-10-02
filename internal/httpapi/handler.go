@@ -19,6 +19,8 @@ type Service interface {
 	CreateAdjustment(ctx context.Context, entitlementID, adjustmentID string, delta int64, effectiveAt time.Time) (entitlements.Adjustment, bool, error)
 	RescheduleEntitlement(ctx context.Context, entitlementID, rescheduleID string, newValidFrom, newValidTo time.Time) (entitlements.Reschedule, bool, error)
 	CreateSeatAdjustment(ctx context.Context, entitlementID, seatAdjustmentID string, delta int64) (entitlements.SeatAdjustment, bool, error)
+	PauseEntitlement(ctx context.Context, entitlementID, businessID string, at time.Time) (entitlements.PauseResumeRecord, bool, error)
+	ResumeEntitlement(ctx context.Context, entitlementID, businessID string, at time.Time) (entitlements.PauseResumeRecord, bool, error)
 	GetView(ctx context.Context, entitlementID string) (entitlements.View, error)
 }
 
@@ -47,6 +49,8 @@ func New(checkDatabase func(context.Context) error, service Service) http.Handle
 	mux.HandleFunc("POST /entitlements/{entitlementID}/adjustments", h.createAdjustment)
 	mux.HandleFunc("POST /entitlements/{entitlementID}/reschedules", h.createReschedule)
 	mux.HandleFunc("POST /entitlements/{entitlementID}/seat-adjustments", h.createSeatAdjustment)
+	mux.HandleFunc("POST /entitlements/{entitlementID}/pauses", h.pauseEntitlement)
+	mux.HandleFunc("POST /entitlements/{entitlementID}/resumes", h.resumeEntitlement)
 	return mux
 }
 
@@ -264,6 +268,48 @@ func (h *handlers) createSeatAdjustment(w http.ResponseWriter, r *http.Request) 
 	respondJSON(w, status, adjustment)
 }
 
+type pauseResumeRequest struct {
+	BusinessID string `json:"business_id"`
+	At         string `json:"at"`
+}
+
+// pauseResume validates the shared pause/resume request body and invokes the
+// given domain call. A missing or malformed time is rejected at the boundary;
+// a missing business identifier reaches the domain, which validates it.
+func (h *handlers) pauseResume(w http.ResponseWriter, r *http.Request,
+	call func(context.Context, string, string, time.Time) (entitlements.PauseResumeRecord, bool, error)) {
+	var req pauseResumeRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	at, err := time.Parse(time.RFC3339, req.At)
+	if req.At == "" || err != nil {
+		respondError(w, &entitlements.Error{
+			Code:    entitlements.CodeInvalidRequest,
+			Message: "at must be an RFC 3339 timestamp, e.g. 2026-06-01T00:00:00Z",
+		})
+		return
+	}
+	record, created, err := call(r.Context(), r.PathValue("entitlementID"), req.BusinessID, at)
+	if err != nil {
+		respondError(w, err)
+		return
+	}
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	respondJSON(w, status, record)
+}
+
+func (h *handlers) pauseEntitlement(w http.ResponseWriter, r *http.Request) {
+	h.pauseResume(w, r, h.service.PauseEntitlement)
+}
+
+func (h *handlers) resumeEntitlement(w http.ResponseWriter, r *http.Request) {
+	h.pauseResume(w, r, h.service.ResumeEntitlement)
+}
+
 func (h *handlers) getEntitlement(w http.ResponseWriter, r *http.Request) {
 	view, err := h.service.GetView(r.Context(), r.PathValue("entitlementID"))
 	if err != nil {
@@ -303,6 +349,10 @@ var errorStatus = map[string]int{
 	entitlements.CodeAdjustmentParamChanged:  http.StatusConflict,
 	entitlements.CodeRescheduleParamChanged:  http.StatusConflict,
 	entitlements.CodeSeatAdjustmentChanged:   http.StatusConflict,
+	entitlements.CodeEntitlementClosed:       http.StatusConflict,
+	entitlements.CodeEntitlementPaused:       http.StatusConflict,
+	entitlements.CodePauseResumeParamChanged: http.StatusConflict,
+	entitlements.CodePauseResumeConflict:     http.StatusConflict,
 }
 
 func respondError(w http.ResponseWriter, err error) {

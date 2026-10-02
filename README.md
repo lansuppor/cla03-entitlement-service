@@ -1,6 +1,6 @@
 # Entitlement service
 
-Go HTTP service for team service entitlements: seat-quota grants with idempotent reservations (each tagged with its owning internal department), confirm/release settlement, corrective reversals of confirmed reservations, scheduled quota-total adjustments, idempotent validity-window reschedules, and immediate idempotent allocation and recovery of the entitlement's seats, persisted in PostgreSQL. Requires Go 1.27.1 and PostgreSQL 18.6.
+Go HTTP service for team service entitlements: seat-quota grants with idempotent reservations (each tagged with its owning internal department), confirm/release settlement, corrective reversals of confirmed reservations, scheduled quota-total adjustments, idempotent validity-window reschedules, immediate idempotent allocation and recovery of the entitlement's seats, one-way expiry closure with a single accounting snapshot, and idempotent pause/resume of issuance within the validity window, persisted in PostgreSQL. Requires Go 1.27.1 and PostgreSQL 18.6.
 
 ```sh
 go mod download
@@ -46,7 +46,7 @@ All requests and responses are JSON. Failures return `{"error":{"code":"...","me
 {"reservation_id":"sub-a-001","department_id":"dept-platform","amount":30}
 ```
 
-`reservation_id` is the caller-supplied business identifier, unique within the entitlement, and `department_id` identifies the internal department the seats are allocated to. The department identifier is required, uses the same character rules as the other business identifiers, and is an immutable reservation attribute set at creation. The first submission returns 201 and holds the quota. Resubmitting the same identifier with the same amount and department returns 200 with the original reservation and does not consume quota again; resubmitting it with a different amount or department fails with 409 `reservation_param_mismatch` and changes nothing. Reservations outside the validity window fail with 422 `entitlement_not_active`; insufficient quota fails with 422 `insufficient_quota` and leaves no partial state.
+`reservation_id` is the caller-supplied business identifier, unique within the entitlement, and `department_id` identifies the internal department the seats are allocated to. The department identifier is required, uses the same character rules as the other business identifiers, and is an immutable reservation attribute set at creation. The first submission returns 201 and holds the quota. Resubmitting the same identifier with the same amount and department returns 200 with the original reservation and does not consume quota again; resubmitting it with a different amount or department fails with 409 `reservation_param_mismatch` and changes nothing. Reservations before the validity window starts fail with 422 `entitlement_not_active`. A request that touches an entitlement whose validity window has elapsed closes it (see below) and fails with 409 `entitlement_closed`; one on a paused entitlement fails with 409 `entitlement_paused`. Insufficient quota fails with 422 `insufficient_quota` and leaves no partial state.
 
 ### Settle a reservation
 
@@ -102,7 +102,35 @@ A reschedule never changes any quota figure — quota total, seats total, used, 
 
 When the customer hands purchased seats down to internal departments, or takes seats back from departments, operations adjusts the seat total of an existing entitlement. `delta` is a non-zero integer: positive allocates seats and grows the seat total immediately, negative recovers seats and shrinks it. The change takes effect at once — there is no effective time. `seat_adjustment_id` is the caller-supplied business identifier, unique within the entitlement. The first submission returns 201, records the seat adjustment and sets `seats_total` to the new value. Resubmitting the same identifier with the same delta returns 200 with the original seat adjustment and does not move the seat total again; resubmitting it with a different delta fails with 409 `seat_adjustment_param_mismatch` and changes nothing. A zero or missing `delta` or a missing/illegal identifier fails with 400 `invalid_request`, and an unknown entitlement fails with 404 `entitlement_not_found`.
 
-A recovery never takes seats that are already distributed to departments: if the adjusted seat total would be lower than the seats currently allocated to internal departments (the amount of every reservation that is pending or confirmed — released seats have been handed back; a corrective reversal leaves the original confirmation in place, so it still counts), the whole request fails with 422 `insufficient_quota` and writes nothing. A recovery that would drop the seat total to zero or below fails the same way. Seat adjustments never change `quota_total`, `used_amount`, `reserved_amount` or `available_amount`, and they do not affect reservations, settlements, reversals, quota adjustments or reschedules and their idempotency rules; all of them, including seat adjustments, are serialized by the same row lock.
+A recovery never takes seats that are already distributed to departments: if the adjusted seat total would be lower than the seats currently allocated to internal departments (the amount of every reservation that is pending or confirmed — released seats have been handed back; a corrective reversal leaves the original confirmation in place, so it still counts), the whole request fails with 422 `insufficient_quota` and writes nothing. A recovery that would drop the seat total to zero or below fails the same way. Seat adjustments never change `quota_total`, `used_amount`, `reserved_amount` or `available_amount`, and they do not affect reservations, settlements, reversals, quota adjustments or reschedules and their idempotency rules; all of them, including seat adjustments, are serialized by the same row lock. A request that touches an entitlement whose window has elapsed closes it and fails with 409 `entitlement_closed`; an identical replay of a seat adjustment already registered still returns 200 with the original record.
+
+### Expiry closure and the closure snapshot
+
+Every entitlement carries a one-way closure state. A new entitlement is open (`status` `pending` or `active` relative to its window). Once the validity window has elapsed, there is no separate "close" call: the **next write or view query that touches the entitlement closes it inside that same transaction**, using the real current time as the closure moment. A view query always commits the closure; a write that is itself rejected (a new reservation, adjustment, reschedule, seat adjustment or pause/resume) fails as a whole and writes nothing, so it neither closes nor snapshots the entitlement — the first *committed* touch performs the one-time close. Repeated touches of an already closed entitlement never produce a second close record.
+
+At closure the service registers exactly one **closure snapshot**, keyed by the entitlement identifier (unique per entitlement). The snapshot records the figures actually in force at the closure moment: `seats_total`, `quota_total`, `used_amount`, the unsettled `reserved_amount`, the `available_amount`, the validity window (`valid_from`, `valid_to`) and `closed_at`. The snapshot is a point-in-time record: settlement, release and corrective reversal of reservations that were already in flight continue after closure and move the live figures, but the snapshot never changes.
+
+Closure is terminal and one-way. A closed entitlement no longer accepts a new reservation, quota adjustment, seat adjustment, reschedule or pause/resume — each fails as a whole with 409 `entitlement_closed` and writes nothing. Even rewriting the validity window back over the current time leaves the entitlement closed. In-flight reservations can still be confirmed or released, and confirmed reservations can still be corrected with a reversal; idempotent replays of records already registered keep returning the original records.
+
+### Pause and resume issuance
+
+Within its validity window an open entitlement can be paused and later resumed. These never change any quota or seat figure, nor the validity window — they only stop and restart the issuing of *new* reservations.
+
+`POST /entitlements/{entitlement_id}/pauses`
+
+```json
+{"business_id":"pause-2026-001","at":"2026-06-01T00:00:00Z"}
+```
+
+`POST /entitlements/{entitlement_id}/resumes`
+
+```json
+{"business_id":"resume-2026-001","at":"2026-06-02T00:00:00Z"}
+```
+
+The caller supplies the `business_id` (unique within the entitlement and independent between the two kinds) and the moment `at`. The first submission returns 201 with the record; replaying the same identifier with the same kind and time returns 200 with the original record and does not take effect again. Reusing an identifier with a different kind or a different time fails as a whole with 409 `pause_resume_param_mismatch` and changes nothing.
+
+A paused entitlement rejects new reservations with 409 `entitlement_paused`; the confirm, release and corrective reversal of in-flight reservations are unaffected. Pausing an already paused entitlement, or resuming one that is not paused, fails with 409 `pause_resume_conflict` and changes nothing. The pause `at` must be no earlier than `valid_from` and no later than `valid_to`; the resume `at` must be later than the corresponding pause moment and no later than `valid_to`; an illegal or missing time, a missing identifier, or an unknown identifier on a nonexistent entitlement fails with 400 `invalid_request` or 404 `entitlement_not_found` respectively, and writes nothing. Pause/resume are serialized with every other operation on the entitlement by the same row lock.
 
 ### Query an entitlement
 
@@ -119,6 +147,8 @@ A recovery never takes seats that are already distributed to departments: if the
   "status": "active",
   "valid_from": "2026-01-01T00:00:00Z",
   "valid_to": "2027-01-01T00:00:00Z",
+  "closed_at": null,
+  "snapshot": null,
   "reservations": [
     {"reservation_id": "sub-a-001", "department_id": "dept-platform", "amount": 30, "status": "confirmed", "settled_at": "...", "created_at": "..."},
     {"reservation_id": "corr-2026-0001", "amount": 30, "status": "reversed", "settled_at": "...", "created_at": "..."}
@@ -131,11 +161,17 @@ A recovery never takes seats that are already distributed to departments: if the
   ],
   "seat_adjustments": [
     {"seat_adjustment_id": "alloc-2026-0017", "delta": 20, "seat_total": 120, "created_at": "..."}
+  ],
+  "pause_resume": [
+    {"business_id": "pause-2026-001", "type": "pause", "at": "2026-03-01T00:00:00Z", "created_at": "..."},
+    {"business_id": "resume-2026-001", "type": "resume", "at": "2026-03-02T00:00:00Z", "created_at": "..."}
   ]
 }
 ```
 
-`status` is `pending`, `active` or `expired` relative to the validity window. Each reservation entry reports its business identifier, owning `department_id`, amount, lifecycle status (`pending`, `confirmed`, `released` for reservations; `reversed` for corrective reversals) and settlement timestamp. `used_amount` is confirmed quota minus effective reversals, so a reversed reservation leaves the original confirmation and the reversal both visible while the quota figures reflect only the net effect. Each adjustment entry reports its business identifier, delta, effective time and whether it is `pending` or `applied`; `quota_total`, `available_amount` and the other figures count only applied adjustments, so they always match the quota actually in force. Each reschedule entry reports its business identifier, the new start and end of the validity window, and its creation time, listed in creation order; the view's top-level `valid_from`, `valid_to` and `status` always reflect the latest reschedule that has taken effect. Each seat adjustment entry reports its business identifier, the seat delta, its creation time and `seat_total`, the cumulative seat total after that adjustment — deltas summed in creation order on top of the entitlement's initial seats; the list is ordered by creation time. Seat adjustments move only `seats_total`, never any quota figure.
+`status` is `pending`, `active`, `expired` or `closed` relative to the validity window and closure state. Each reservation entry reports its business identifier, owning `department_id`, amount, lifecycle status (`pending`, `confirmed`, `released` for reservations; `reversed` for corrective reversals) and settlement timestamp. `used_amount` is confirmed quota minus effective reversals, so a reversed reservation leaves the original confirmation and the reversal both visible while the quota figures reflect only the net effect. Each adjustment entry reports its business identifier, delta, effective time and whether it is `pending` or `applied`; `quota_total`, `available_amount` and the other figures count only applied adjustments, so they always match the quota actually in force. Each reschedule entry reports its business identifier, the new start and end of the validity window, and its creation time, listed in creation order; the view's top-level `valid_from`, `valid_to` and `status` always reflect the latest reschedule that has taken effect. Each seat adjustment entry reports its business identifier, the seat delta, its creation time and `seat_total`, the cumulative seat total after that adjustment — deltas summed in creation order on top of the entitlement's initial seats; the list is ordered by creation time. Seat adjustments move only `seats_total`, never any quota figure.
+
+The view additionally reports the closure state and the pause/resume ledger. While open, `closed_at` and `snapshot` are both `null`; once closed, `status` is `closed`, `closed_at` is the closure moment and `snapshot` is the single closure snapshot object with `seats_total`, `quota_total`, `used_amount`, `reserved_amount`, `available_amount`, `valid_from`, `valid_to` and `closed_at` as they were at that moment. `pause_resume` lists every pause and resume record in registration order, each with its `business_id`, `type` (`pause` or `resume`), the caller-supplied `at` and the registration time; it is an empty list when no pause or resume has been registered.
 
 ### Error codes
 
@@ -154,10 +190,14 @@ A recovery never takes seats that are already distributed to departments: if the
 | `adjustment_param_mismatch` | 409 | Adjustment identifier reused with a different delta or effective time |
 | `reschedule_param_mismatch` | 409 | Reschedule identifier reused with a different new start or new end |
 | `seat_adjustment_param_mismatch` | 409 | Seat adjustment identifier reused with a different delta |
+| `entitlement_closed` | 409 | Entitlement has closed after its window elapsed and rejects this change |
+| `entitlement_paused` | 409 | Entitlement is paused, so it issues no new reservation |
+| `pause_resume_param_mismatch` | 409 | Pause/resume identifier reused with a different kind or time |
+| `pause_resume_conflict` | 409 | Pausing an already paused entitlement, or resuming one that is not paused |
 
 ## Consistency
 
-Concurrent reservations, confirmations, releases, reversals, adjustments, reschedules and seat adjustments on the same entitlement are serialized with a row lock in PostgreSQL, so used quota plus unsettled reservations never exceeds the total quota, the seat total never drops below the seats allocated to departments, repeated requests never grant, refund, adjust quota, rewrite the validity window or move the seat total twice, and failed requests leave no partial results. A reschedule only rewrites `valid_from`/`valid_to` — it never touches a quota figure, a reservation, a reversal or an adjustment record, and adjustments still apply solely by their own effective time. A seat adjustment only rewrites `seats_total` — it never touches a quota figure, a reservation, a reversal, a quota adjustment or a reschedule; the cumulative `seat_total` stored on each record always matches the entitlement's current `seats_total`. Due quota adjustments are folded into the quota total inside the same lock — by whichever operation or query touches the entitlement first after the effective time — so every adjustment applies exactly once and a decrease never crowds out occupied quota. All state lives in PostgreSQL, so a restart preserves every quota and seat figure, reservation including its owning department, reversal record, adjustment record including its applied or pending state, reschedule record including the rescheduled window, and every seat adjustment including its cumulative total.
+Concurrent reservations, confirmations, releases, reversals, adjustments, reschedules and seat adjustments on the same entitlement are serialized with a row lock in PostgreSQL, so used quota plus unsettled reservations never exceeds the total quota, the seat total never drops below the seats allocated to departments, repeated requests never grant, refund, adjust quota, rewrite the validity window or move the seat total twice, and failed requests leave no partial results. A reschedule only rewrites `valid_from`/`valid_to` — it never touches a quota figure, a reservation, a reversal or an adjustment record, and adjustments still apply solely by their own effective time. A seat adjustment only rewrites `seats_total` — it never touches a quota figure, a reservation, a reversal, a quota adjustment or a reschedule; the cumulative `seat_total` stored on each record always matches the entitlement's current `seats_total`. Due quota adjustments are folded into the quota total inside the same lock — by whichever operation or query touches the entitlement first after the effective time — so every adjustment applies exactly once and a decrease never crowds out occupied quota. Expiry closure runs inside that same lock on the first committed touch after the window: the entitlement is closed and its single snapshot is inserted in one transaction, so closure happens at most once even under concurrent touches and a request that is itself rejected rolls the provisional close back and leaves no close or snapshot behind. Closure is one-way, so no later reschedule can reopen it. Pause and resume serialize on the same lock and only flip the pause flag while appending one ledger row: replays never take effect twice, a pause never double-counts, and a resume without its pause is impossible. All state lives in PostgreSQL, so a restart preserves every quota and seat figure, reservation including its owning department, reversal record, adjustment record including its applied or pending state, reschedule record including the rescheduled window, every seat adjustment including its cumulative total, the closure state with its closure moment and single snapshot, and every pause/resume record.
 
 The local setup uses a trusted loopback connection and C collation without ICU. Use separate database directories, database ports and HTTP ports when running multiple copies.
 
@@ -299,3 +339,67 @@ curl -s -X POST 127.0.0.1:8080/entitlements/team-missing/seat-adjustments -d '{"
 ```
 
 After restarting the server, `GET /entitlements/team-delta` still shows `seats_total` 60 and the same cumulative seat-adjustment list; replaying `recover-002` with `delta -30` returns 200 with the original record and leaves the total at 60.
+
+## Verifying closure, the snapshot and pause/resume
+
+With the server running, the pause/resume and expiry-closure cycle can be exercised with curl. The timestamp helpers use the macOS `date` syntax; fixed RFC 3339 strings work on any platform.
+
+```sh
+PAST=$(date -u -v-1H +%Y-%m-%dT%H:%M:%SZ)
+FUTURE=$(date -u -v+2H +%Y-%m-%dT%H:%M:%SZ)
+PAUSE=$(date -u -v-30M +%Y-%m-%dT%H:%M:%SZ)
+RESUME=$(date -u -v+1H +%Y-%m-%dT%H:%M:%SZ)
+
+# 100 quota, occupy 30 confirmed and hold 20 more.
+curl -s -X POST 127.0.0.1:8080/entitlements -d '{"entitlement_id":"team-epsilon","quota_total":100,"valid_from":"2026-01-01T00:00:00Z","valid_to":"2027-01-01T00:00:00Z"}'
+curl -s -X POST 127.0.0.1:8080/entitlements/team-epsilon/reservations -d '{"reservation_id":"sub-e-001","department_id":"dept-sales","amount":30}'
+curl -s -X POST 127.0.0.1:8080/entitlements/team-epsilon/reservations/sub-e-001/confirm
+curl -s -X POST 127.0.0.1:8080/entitlements/team-epsilon/reservations -d '{"reservation_id":"sub-e-002","department_id":"dept-sales","amount":20}'
+
+# While open the view carries closed_at null, snapshot null and an empty ledger.
+curl -s 127.0.0.1:8080/entitlements/team-epsilon
+
+# Pause issuance. Replays and state violations are safe no-ops.
+curl -s -X POST 127.0.0.1:8080/entitlements/team-epsilon/pauses  -d "{\"business_id\":\"pause-1\",\"at\":\"$PAUSE\"}"   # 201
+curl -s -X POST 127.0.0.1:8080/entitlements/team-epsilon/pauses  -d "{\"business_id\":\"pause-1\",\"at\":\"$PAUSE\"}"   # 200, original
+curl -s -X POST 127.0.0.1:8080/entitlements/team-epsilon/pauses  -d "{\"business_id\":\"pause-1\",\"at\":\"$FUTURE\"}"  # 409 pause_resume_param_mismatch
+curl -s -X POST 127.0.0.1:8080/entitlements/team-epsilon/pauses  -d "{\"business_id\":\"pause-2\",\"at\":\"$PAUSE\"}"   # 409 pause_resume_conflict
+curl -s -X POST 127.0.0.1:8080/entitlements/team-epsilon/reservations -d '{"reservation_id":"sub-e-003","department_id":"dept-sales","amount":1}'  # 409 entitlement_paused
+# In-flight settlement is unaffected by the pause.
+curl -s -X POST 127.0.0.1:8080/entitlements/team-epsilon/reservations/sub-e-002/release                                  # 200
+
+# Resume; new reservations are accepted again.
+curl -s -X POST 127.0.0.1:8080/entitlements/team-epsilon/resumes -d "{\"business_id\":\"resume-1\",\"at\":\"$RESUME\"}"  # 201
+curl -s -X POST 127.0.0.1:8080/entitlements/team-epsilon/resumes -d "{\"business_id\":\"resume-2\",\"at\":\"$RESUME\"}"  # 409 pause_resume_conflict
+curl -s -X POST 127.0.0.1:8080/entitlements/team-epsilon/reservations -d '{"reservation_id":"sub-e-004","department_id":"dept-sales","amount":10}'  # 201
+
+# Illegal moments, missing input and unknown entitlements stay distinguishable.
+curl -s -X POST 127.0.0.1:8080/entitlements/team-epsilon/pauses  -d "{\"business_id\":\"pause-x\",\"at\":\"2020-01-01T00:00:00Z\"}"  # 400 invalid_request
+curl -s -X POST 127.0.0.1:8080/entitlements/team-missing/pauses  -d "{\"business_id\":\"pause-x\",\"at\":\"$PAUSE\"}"               # 404 entitlement_not_found
+
+# Move the end into the past. The next rejected write does not close the
+# entitlement (it fails as a whole and writes nothing); the first allowed
+# write or a view performs the one-time close and snapshot.
+EXPIRED=$(date -u -v-1M +%Y-%m-%dT%H:%M:%SZ)
+curl -s -X POST 127.0.0.1:8080/entitlements/team-epsilon/reschedules -d "{\"reschedule_id\":\"move-expire\",\"new_valid_from\":\"2026-01-01T00:00:00Z\",\"new_valid_to\":\"$EXPIRED\"}"
+curl -s -X POST 127.0.0.1:8080/entitlements/team-epsilon/reservations -d '{"reservation_id":"sub-late","department_id":"dept-sales","amount":1}'  # 409 entitlement_closed
+# New issuance and every figure/window change are now refused atomically.
+curl -s -X POST 127.0.0.1:8080/entitlements/team-epsilon/adjustments     -d "{\"adjustment_id\":\"a1\",\"delta\":5,\"effective_at\":\"$PAST\"}"  # 409 entitlement_closed
+curl -s -X POST 127.0.0.1:8080/entitlements/team-epsilon/seat-adjustments -d '{"seat_adjustment_id":"s1","delta":5}'                              # 409 entitlement_closed
+# In-flight settlement and correction still proceed; one of these is the
+# first committed touch after expiry and performs the close + snapshot.
+curl -s -X POST 127.0.0.1:8080/entitlements/team-epsilon/reservations/sub-e-004/release                                   # 200
+curl -s -X POST 127.0.0.1:8080/entitlements/team-epsilon/reservations/sub-e-001/reverse -d '{"reversal_id":"corr-e-001"}' # 201
+
+# The view is status "closed": closed_at is set, snapshot holds the figures
+# at the closure moment (used 30, reserved 10, available 60 before the
+# settlement above), pause_resume lists pause-1 then resume-1 in order, and
+# live figures have since moved without altering the snapshot.
+curl -s 127.0.0.1:8080/entitlements/team-epsilon
+
+# Closure is one-way even when the window is moved back over the present.
+curl -s -X POST 127.0.0.1:8080/entitlements/team-epsilon/reschedules -d "{\"reschedule_id\":\"reopen\",\"new_valid_from\":\"$PAST\",\"new_valid_to\":\"$FUTURE\"}"  # 409 entitlement_closed
+```
+
+After restarting the server, `GET /entitlements/team-epsilon` still reports `status` `closed` with the same `closed_at`, the unchanged single snapshot and the same ordered `pause_resume` ledger; replaying `pause-1`/`resume-1` with their exact parameters returns 200 with the original records, and no second snapshot row is ever created.
+

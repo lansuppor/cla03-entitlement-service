@@ -175,8 +175,10 @@ func TestValidityWindow(t *testing.T) {
 
 	expiredID := uniqueID(t)
 	mustCreate(t, store, expiredID, 10, now.Add(-2*time.Hour), now.Add(-time.Hour))
+	// The first touch after the window elapsed closes the entitlement inside
+	// the request, so a new reservation is rejected as closed.
 	_, _, err = store.CreateReservation(ctx, expiredID, "res-1", "dept-1", 1)
-	wantCode(t, err, CodeEntitlementNotActive)
+	wantCode(t, err, CodeEntitlementClosed)
 
 	// A reservation made while active can still settle after expiry.
 	liveID := uniqueID(t)
@@ -188,13 +190,14 @@ func TestValidityWindow(t *testing.T) {
 		t.Fatalf("expire entitlement: %v", err)
 	}
 	_, _, err = store.CreateReservation(ctx, liveID, "res-2", "dept-1", 1)
-	wantCode(t, err, CodeEntitlementNotActive)
+	wantCode(t, err, CodeEntitlementClosed)
+	// In-flight settlement stays allowed after closure.
 	settled, err := store.SettleReservation(ctx, liveID, "res-1", ActionConfirm)
 	if err != nil || settled.Status != StatusConfirmed {
 		t.Fatalf("confirm after expiry: %+v err=%v", settled, err)
 	}
 	view, _ := store.GetView(ctx, liveID)
-	if view.Status != "expired" || view.UsedAmount != 5 {
+	if view.Status != StatusClosed || view.UsedAmount != 5 || view.ClosedAt == nil || view.Snapshot == nil {
 		t.Fatalf("view after expiry: %+v", view)
 	}
 }
@@ -430,15 +433,18 @@ func TestReverseAfterExpiry(t *testing.T) {
 	if _, err := store.pool.Exec(ctx, `UPDATE entitlements SET valid_to = now() - interval '1 minute' WHERE entitlement_id = $1`, id); err != nil {
 		t.Fatalf("expire entitlement: %v", err)
 	}
-	// New reservations are still rejected, but reversal stays allowed.
+	// The first write after the window closes the entitlement, so a new
+	// reservation is rejected as closed, but correcting a confirmed
+	// reservation stays allowed.
 	_, _, err := store.CreateReservation(ctx, id, "res-2", "dept-1", 1)
-	wantCode(t, err, CodeEntitlementNotActive)
+	wantCode(t, err, CodeEntitlementClosed)
 	reversal, created, err := store.ReverseReservation(ctx, id, "res-1", "corr-1")
 	if err != nil || !created || reversal.Amount != 20 {
 		t.Fatalf("reverse after expiry: %+v created=%v err=%v", reversal, created, err)
 	}
 	view, _ := store.GetView(ctx, id)
-	if view.Status != "expired" || view.UsedAmount != 0 || view.AvailableAmount != 50 {
+	if view.Status != StatusClosed || view.UsedAmount != 0 || view.AvailableAmount != 50 ||
+		view.Snapshot == nil || view.Snapshot.UsedAmount != 20 || view.Snapshot.QuotaTotal != 50 {
 		t.Fatalf("view after expiry reversal: %+v", view)
 	}
 }
@@ -999,7 +1005,9 @@ func TestRescheduleChangesActiveStateNotQuota(t *testing.T) {
 		t.Fatalf("reschedule into expiry: %v", err)
 	}
 	_, _, err := store.CreateReservation(ctx, id, "res-3", "dept-1", 1)
-	wantCode(t, err, CodeEntitlementNotActive)
+	// That write is the first touch after the rewritten end and closes the
+	// entitlement inside the request, so the new hold is rejected as closed.
+	wantCode(t, err, CodeEntitlementClosed)
 	if _, err := store.SettleReservation(ctx, id, "res-2", ActionRelease); err != nil {
 		t.Fatalf("release after new expiry: %v", err)
 	}
@@ -1007,7 +1015,7 @@ func TestRescheduleChangesActiveStateNotQuota(t *testing.T) {
 		t.Fatalf("reverse after new expiry: %v", err)
 	}
 	view, _ = store.GetView(ctx, id)
-	if view.Status != "expired" || !view.ValidTo.Equal(expireTo) {
+	if view.Status != StatusClosed || !view.ValidTo.Equal(expireTo) || view.ClosedAt == nil {
 		t.Fatalf("status after new expiry: %+v", view)
 	}
 	// No quota figure moved because of the reschedules themselves.
@@ -1019,18 +1027,17 @@ func TestRescheduleChangesActiveStateNotQuota(t *testing.T) {
 		t.Fatalf("reschedule list should keep both records: %+v", view.Reschedules)
 	}
 
-	// Pulling the window back open makes new reservations possible again.
+	// Closure is one-way: pulling the window back open is rejected and leaves
+	// both the window and the closed state untouched, as does a new hold.
 	reopenFrom := now.Add(-time.Hour).UTC().Truncate(time.Microsecond)
 	reopenTo := now.Add(time.Hour).UTC().Truncate(time.Microsecond)
-	if _, _, err := store.RescheduleEntitlement(ctx, id, "move-reopen", reopenFrom, reopenTo); err != nil {
-		t.Fatalf("reschedule reopen: %v", err)
-	}
-	if _, _, err := store.CreateReservation(ctx, id, "res-4", "dept-1", 10); err != nil {
-		t.Fatalf("reserve after reopening window: %v", err)
-	}
+	_, _, err = store.RescheduleEntitlement(ctx, id, "move-reopen", reopenFrom, reopenTo)
+	wantCode(t, err, CodeEntitlementClosed)
+	_, _, err = store.CreateReservation(ctx, id, "res-4", "dept-1", 10)
+	wantCode(t, err, CodeEntitlementClosed)
 	view, _ = store.GetView(ctx, id)
-	if view.Status != "active" || view.ReservedAmount != 10 || view.AvailableAmount != 90 {
-		t.Fatalf("state after reopening: %+v", view)
+	if view.Status != StatusClosed || !view.ValidTo.Equal(expireTo) || len(view.Reschedules) != 2 {
+		t.Fatalf("closed entitlement was reopened: %+v", view)
 	}
 }
 
@@ -1121,10 +1128,14 @@ func TestReschedulesOrderedInView(t *testing.T) {
 			t.Fatalf("reschedule entry %d: %+v", i, view.Reschedules[i])
 		}
 	}
-	// The view's window reflects the latest reschedule.
+	// The view's window reflects the latest reschedule; its past end means
+	// the view query also closes the entitlement once.
 	last := view.Reschedules[2]
-	if !view.ValidFrom.Equal(last.NewValidFrom) || !view.ValidTo.Equal(last.NewValidTo) || view.Status != "expired" {
-		t.Fatalf("view window should reflect latest reschedule: %+v", view)
+	if !view.ValidFrom.Equal(last.NewValidFrom) || !view.ValidTo.Equal(last.NewValidTo) || view.Status != StatusClosed {
+		t.Fatalf("view window should reflect latest reschedule and be closed: %+v", view)
+	}
+	if view.ClosedAt == nil || view.Snapshot == nil || !view.Snapshot.ValidTo.Equal(last.NewValidTo) {
+		t.Fatalf("closure snapshot missing or inconsistent: %+v", view)
 	}
 }
 
@@ -1202,17 +1213,22 @@ func TestReschedulesSurviveReconnection(t *testing.T) {
 		t.Fatalf("view after restart: %v", err)
 	}
 	if !view.ValidFrom.Equal(newFrom) || !view.ValidTo.Equal(newTo) ||
-		view.Status != "expired" || len(view.Reschedules) != 1 {
-		t.Fatalf("rescheduled window lost across restart: %+v", view)
+		view.Status != StatusClosed || len(view.Reschedules) != 1 ||
+		view.ClosedAt == nil || view.Snapshot == nil {
+		t.Fatalf("rescheduled window and closure lost across restart: %+v", view)
 	}
-	// The reschedule identifier is still replayed, not re-applied.
+	// The reschedule identifier is still replayed, not re-applied, even once
+	// closed.
 	replay, created, err := restarted.RescheduleEntitlement(ctx, id, "move-1", newFrom, newTo)
 	if err != nil || created || !replay.NewValidFrom.Equal(newFrom) {
 		t.Fatalf("reschedule replay after restart: %+v created=%v err=%v", replay, created, err)
 	}
-	// New reservations stay blocked by the persisted, already-expired window.
+	// A different reschedule identifier is refused because closure is
+	// one-way; a new hold is refused as closed as well.
+	_, _, err = restarted.RescheduleEntitlement(ctx, id, "move-reopen", newFrom, time.Now().Add(time.Hour))
+	wantCode(t, err, CodeEntitlementClosed)
 	_, _, err = restarted.CreateReservation(ctx, id, "res-1", "dept-1", 1)
-	wantCode(t, err, CodeEntitlementNotActive)
+	wantCode(t, err, CodeEntitlementClosed)
 }
 
 func createSeatEntitlement(t *testing.T, store *Store, seats, quota int64) string {
