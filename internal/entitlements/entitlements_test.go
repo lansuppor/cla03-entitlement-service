@@ -121,11 +121,11 @@ func TestReservationIdempotency(t *testing.T) {
 	mustCreate(t, store, id, 100, from, to)
 	ctx := context.Background()
 
-	first, created, err := store.CreateReservation(ctx, id, "res-1", 30)
+	first, created, err := store.CreateReservation(ctx, id, "res-1", "dept-1", 30)
 	if err != nil || !created || first.Status != StatusPending {
 		t.Fatalf("first create: %+v created=%v err=%v", first, created, err)
 	}
-	replay, created, err := store.CreateReservation(ctx, id, "res-1", 30)
+	replay, created, err := store.CreateReservation(ctx, id, "res-1", "dept-1", 30)
 	if err != nil || created || replay != first {
 		t.Fatalf("replay should return the original: %+v created=%v err=%v", replay, created, err)
 	}
@@ -137,7 +137,7 @@ func TestReservationIdempotency(t *testing.T) {
 		t.Fatalf("replay consumed quota again: %+v", view)
 	}
 
-	_, _, err = store.CreateReservation(ctx, id, "res-1", 40)
+	_, _, err = store.CreateReservation(ctx, id, "res-1", "dept-1", 40)
 	wantCode(t, err, CodeReservationParamChanged)
 	view, _ = store.GetView(ctx, id)
 	if view.ReservedAmount != 30 {
@@ -152,10 +152,10 @@ func TestInsufficientQuotaLeavesNoPartialState(t *testing.T) {
 	mustCreate(t, store, id, 50, from, to)
 	ctx := context.Background()
 
-	if _, _, err := store.CreateReservation(ctx, id, "res-1", 40); err != nil {
+	if _, _, err := store.CreateReservation(ctx, id, "res-1", "dept-1", 40); err != nil {
 		t.Fatalf("reserve: %v", err)
 	}
-	_, _, err := store.CreateReservation(ctx, id, "res-2", 20)
+	_, _, err := store.CreateReservation(ctx, id, "res-2", "dept-1", 20)
 	wantCode(t, err, CodeInsufficientQuota)
 	view, _ := store.GetView(ctx, id)
 	if view.ReservedAmount != 40 || view.AvailableAmount != 10 || len(view.Reservations) != 1 {
@@ -170,24 +170,24 @@ func TestValidityWindow(t *testing.T) {
 
 	futureID := uniqueID(t)
 	mustCreate(t, store, futureID, 10, now.Add(time.Hour), now.Add(2*time.Hour))
-	_, _, err := store.CreateReservation(ctx, futureID, "res-1", 1)
+	_, _, err := store.CreateReservation(ctx, futureID, "res-1", "dept-1", 1)
 	wantCode(t, err, CodeEntitlementNotActive)
 
 	expiredID := uniqueID(t)
 	mustCreate(t, store, expiredID, 10, now.Add(-2*time.Hour), now.Add(-time.Hour))
-	_, _, err = store.CreateReservation(ctx, expiredID, "res-1", 1)
+	_, _, err = store.CreateReservation(ctx, expiredID, "res-1", "dept-1", 1)
 	wantCode(t, err, CodeEntitlementNotActive)
 
 	// A reservation made while active can still settle after expiry.
 	liveID := uniqueID(t)
 	mustCreate(t, store, liveID, 10, now.Add(-time.Hour), now.Add(time.Hour))
-	if _, _, err := store.CreateReservation(ctx, liveID, "res-1", 5); err != nil {
+	if _, _, err := store.CreateReservation(ctx, liveID, "res-1", "dept-1", 5); err != nil {
 		t.Fatalf("reserve: %v", err)
 	}
 	if _, err := store.pool.Exec(ctx, `UPDATE entitlements SET valid_to = now() - interval '1 minute' WHERE entitlement_id = $1`, liveID); err != nil {
 		t.Fatalf("expire entitlement: %v", err)
 	}
-	_, _, err = store.CreateReservation(ctx, liveID, "res-2", 1)
+	_, _, err = store.CreateReservation(ctx, liveID, "res-2", "dept-1", 1)
 	wantCode(t, err, CodeEntitlementNotActive)
 	settled, err := store.SettleReservation(ctx, liveID, "res-1", ActionConfirm)
 	if err != nil || settled.Status != StatusConfirmed {
@@ -206,7 +206,7 @@ func TestSettleExactlyOnce(t *testing.T) {
 	mustCreate(t, store, id, 100, from, to)
 	ctx := context.Background()
 
-	if _, _, err := store.CreateReservation(ctx, id, "res-1", 30); err != nil {
+	if _, _, err := store.CreateReservation(ctx, id, "res-1", "dept-1", 30); err != nil {
 		t.Fatalf("reserve: %v", err)
 	}
 	confirmed, err := store.SettleReservation(ctx, id, "res-1", ActionConfirm)
@@ -218,7 +218,7 @@ func TestSettleExactlyOnce(t *testing.T) {
 	_, err = store.SettleReservation(ctx, id, "res-1", ActionRelease)
 	wantCode(t, err, CodeReservationSettled)
 
-	if _, _, err := store.CreateReservation(ctx, id, "res-2", 20); err != nil {
+	if _, _, err := store.CreateReservation(ctx, id, "res-2", "dept-1", 20); err != nil {
 		t.Fatalf("reserve: %v", err)
 	}
 	released, err := store.SettleReservation(ctx, id, "res-2", ActionRelease)
@@ -260,7 +260,7 @@ func TestConcurrentReservationsNeverExceedQuota(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < 4; i++ {
 				rid := fmt.Sprintf("res-%d-%d", w, i)
-				if _, _, err := store.CreateReservation(ctx, id, rid, 10); err != nil {
+				if _, _, err := store.CreateReservation(ctx, id, rid, "dept-1", 10); err != nil {
 					errs <- err
 					continue
 				}
@@ -301,7 +301,7 @@ func TestReverseReservation(t *testing.T) {
 	mustCreate(t, store, id, 100, from, to)
 	ctx := context.Background()
 
-	if _, _, err := store.CreateReservation(ctx, id, "res-1", 30); err != nil {
+	if _, _, err := store.CreateReservation(ctx, id, "res-1", "dept-1", 30); err != nil {
 		t.Fatalf("reserve: %v", err)
 	}
 	if _, err := store.SettleReservation(ctx, id, "res-1", ActionConfirm); err != nil {
@@ -353,7 +353,7 @@ func TestReverseReservation(t *testing.T) {
 	}
 
 	// The same correction identifier targeting another reservation fails.
-	if _, _, err := store.CreateReservation(ctx, id, "res-2", 10); err != nil {
+	if _, _, err := store.CreateReservation(ctx, id, "res-2", "dept-1", 10); err != nil {
 		t.Fatalf("reserve: %v", err)
 	}
 	if _, err := store.SettleReservation(ctx, id, "res-2", ActionConfirm); err != nil {
@@ -383,12 +383,12 @@ func TestReverseValidation(t *testing.T) {
 	ctx := context.Background()
 
 	// Pending and released reservations cannot be reversed.
-	if _, _, err := store.CreateReservation(ctx, id, "res-pending", 10); err != nil {
+	if _, _, err := store.CreateReservation(ctx, id, "res-pending", "dept-1", 10); err != nil {
 		t.Fatalf("reserve: %v", err)
 	}
 	_, _, err := store.ReverseReservation(ctx, id, "res-pending", "corr-1")
 	wantCode(t, err, CodeReservationNotConfirmed)
-	if _, _, err := store.CreateReservation(ctx, id, "res-released", 10); err != nil {
+	if _, _, err := store.CreateReservation(ctx, id, "res-released", "dept-1", 10); err != nil {
 		t.Fatalf("reserve: %v", err)
 	}
 	if _, err := store.SettleReservation(ctx, id, "res-released", ActionRelease); err != nil {
@@ -421,7 +421,7 @@ func TestReverseAfterExpiry(t *testing.T) {
 	id := uniqueID(t)
 	mustCreate(t, store, id, 50, from, to)
 	ctx := context.Background()
-	if _, _, err := store.CreateReservation(ctx, id, "res-1", 20); err != nil {
+	if _, _, err := store.CreateReservation(ctx, id, "res-1", "dept-1", 20); err != nil {
 		t.Fatalf("reserve: %v", err)
 	}
 	if _, err := store.SettleReservation(ctx, id, "res-1", ActionConfirm); err != nil {
@@ -431,7 +431,7 @@ func TestReverseAfterExpiry(t *testing.T) {
 		t.Fatalf("expire entitlement: %v", err)
 	}
 	// New reservations are still rejected, but reversal stays allowed.
-	_, _, err := store.CreateReservation(ctx, id, "res-2", 1)
+	_, _, err := store.CreateReservation(ctx, id, "res-2", "dept-1", 1)
 	wantCode(t, err, CodeEntitlementNotActive)
 	reversal, created, err := store.ReverseReservation(ctx, id, "res-1", "corr-1")
 	if err != nil || !created || reversal.Amount != 20 {
@@ -450,7 +450,7 @@ func TestConcurrentReversalsSettleOnce(t *testing.T) {
 	const quota = 100
 	mustCreate(t, store, id, quota, from, to)
 	ctx := context.Background()
-	if _, _, err := store.CreateReservation(ctx, id, "res-1", 40); err != nil {
+	if _, _, err := store.CreateReservation(ctx, id, "res-1", "dept-1", 40); err != nil {
 		t.Fatalf("reserve: %v", err)
 	}
 	if _, err := store.SettleReservation(ctx, id, "res-1", ActionConfirm); err != nil {
@@ -504,7 +504,7 @@ func TestStateSurvivesReconnection(t *testing.T) {
 	id := uniqueID(t)
 	mustCreate(t, store, id, 100, from, to)
 	ctx := context.Background()
-	if _, _, err := store.CreateReservation(ctx, id, "res-1", 30); err != nil {
+	if _, _, err := store.CreateReservation(ctx, id, "res-1", "dept-1", 30); err != nil {
 		t.Fatalf("reserve: %v", err)
 	}
 	if _, err := store.SettleReservation(ctx, id, "res-1", ActionConfirm); err != nil {
@@ -679,10 +679,10 @@ func TestAdjustmentAppliesExactlyOnceWhenDue(t *testing.T) {
 	}
 
 	// The grown total is what reservations are checked against.
-	if _, _, err := store.CreateReservation(ctx, id, "res-1", 180); err != nil {
+	if _, _, err := store.CreateReservation(ctx, id, "res-1", "dept-1", 180); err != nil {
 		t.Fatalf("reserve against adjusted quota: %v", err)
 	}
-	_, _, err = store.CreateReservation(ctx, id, "res-2", 1)
+	_, _, err = store.CreateReservation(ctx, id, "res-2", "dept-1", 1)
 	wantCode(t, err, CodeInsufficientQuota)
 }
 
@@ -694,13 +694,13 @@ func TestDecreaseAdjustmentBlockedByOccupancy(t *testing.T) {
 	ctx := context.Background()
 
 	// Occupy 80 of 100: 60 confirmed, 20 still reserved.
-	if _, _, err := store.CreateReservation(ctx, id, "res-confirm", 60); err != nil {
+	if _, _, err := store.CreateReservation(ctx, id, "res-confirm", "dept-1", 60); err != nil {
 		t.Fatalf("reserve: %v", err)
 	}
 	if _, err := store.SettleReservation(ctx, id, "res-confirm", ActionConfirm); err != nil {
 		t.Fatalf("confirm: %v", err)
 	}
-	if _, _, err := store.CreateReservation(ctx, id, "res-pending", 20); err != nil {
+	if _, _, err := store.CreateReservation(ctx, id, "res-pending", "dept-1", 20); err != nil {
 		t.Fatalf("reserve: %v", err)
 	}
 
@@ -766,7 +766,7 @@ func TestDecreaseNeverCrowdsOutOccupiedQuota(t *testing.T) {
 
 	// Occupy the reduced total fully, then register another decrease: it
 	// must stay pending while used plus reserved exceeds the adjusted total.
-	if _, _, err := store.CreateReservation(ctx, id, "res-1", 20); err != nil {
+	if _, _, err := store.CreateReservation(ctx, id, "res-1", "dept-1", 20); err != nil {
 		t.Fatalf("reserve: %v", err)
 	}
 	if _, err := store.SettleReservation(ctx, id, "res-1", ActionConfirm); err != nil {
@@ -966,7 +966,7 @@ func TestRescheduleChangesActiveStateNotQuota(t *testing.T) {
 	id := uniqueID(t)
 	// Starts in the future: nothing can be reserved yet.
 	mustCreate(t, store, id, 100, now.Add(time.Hour), now.Add(3*time.Hour))
-	if _, _, err := store.CreateReservation(ctx, id, "res-1", 30); err != nil {
+	if _, _, err := store.CreateReservation(ctx, id, "res-1", "dept-1", 30); err != nil {
 		wantCode(t, err, CodeEntitlementNotActive)
 	}
 
@@ -976,10 +976,10 @@ func TestRescheduleChangesActiveStateNotQuota(t *testing.T) {
 	if _, _, err := store.RescheduleEntitlement(ctx, id, "move-enter", enterFrom, enterTo); err != nil {
 		t.Fatalf("reschedule into window: %v", err)
 	}
-	if _, _, err := store.CreateReservation(ctx, id, "res-1", 30); err != nil {
+	if _, _, err := store.CreateReservation(ctx, id, "res-1", "dept-1", 30); err != nil {
 		t.Fatalf("reserve after entering new window: %v", err)
 	}
-	if _, _, err := store.CreateReservation(ctx, id, "res-2", 20); err != nil {
+	if _, _, err := store.CreateReservation(ctx, id, "res-2", "dept-1", 20); err != nil {
 		t.Fatalf("reserve pending amount: %v", err)
 	}
 	if _, err := store.SettleReservation(ctx, id, "res-1", ActionConfirm); err != nil {
@@ -998,7 +998,7 @@ func TestRescheduleChangesActiveStateNotQuota(t *testing.T) {
 	if _, _, err := store.RescheduleEntitlement(ctx, id, "move-expire", expireFrom, expireTo); err != nil {
 		t.Fatalf("reschedule into expiry: %v", err)
 	}
-	_, _, err := store.CreateReservation(ctx, id, "res-3", 1)
+	_, _, err := store.CreateReservation(ctx, id, "res-3", "dept-1", 1)
 	wantCode(t, err, CodeEntitlementNotActive)
 	if _, err := store.SettleReservation(ctx, id, "res-2", ActionRelease); err != nil {
 		t.Fatalf("release after new expiry: %v", err)
@@ -1025,7 +1025,7 @@ func TestRescheduleChangesActiveStateNotQuota(t *testing.T) {
 	if _, _, err := store.RescheduleEntitlement(ctx, id, "move-reopen", reopenFrom, reopenTo); err != nil {
 		t.Fatalf("reschedule reopen: %v", err)
 	}
-	if _, _, err := store.CreateReservation(ctx, id, "res-4", 10); err != nil {
+	if _, _, err := store.CreateReservation(ctx, id, "res-4", "dept-1", 10); err != nil {
 		t.Fatalf("reserve after reopening window: %v", err)
 	}
 	view, _ = store.GetView(ctx, id)
@@ -1081,7 +1081,7 @@ func TestRescheduleDoesNotInteractWithAdjustments(t *testing.T) {
 	if _, _, err := store.RescheduleEntitlement(ctx, id, "move-2", reopenFrom, reopenTo); err != nil {
 		t.Fatalf("reschedule reopen: %v", err)
 	}
-	if _, _, err := store.CreateReservation(ctx, id, "res-1", 110); err != nil {
+	if _, _, err := store.CreateReservation(ctx, id, "res-1", "dept-1", 110); err != nil {
 		t.Fatalf("reserve against adjusted total: %v", err)
 	}
 	view, _ = store.GetView(ctx, id)
@@ -1153,7 +1153,7 @@ func TestConcurrentReschedulesRewriteOnce(t *testing.T) {
 				errs <- err
 			}
 			rid := fmt.Sprintf("res-%d", w)
-			if _, _, err := store.CreateReservation(ctx, id, rid, 5); err != nil {
+			if _, _, err := store.CreateReservation(ctx, id, rid, "dept-1", 5); err != nil {
 				errs <- err
 				return
 			}
@@ -1211,6 +1211,398 @@ func TestReschedulesSurviveReconnection(t *testing.T) {
 		t.Fatalf("reschedule replay after restart: %+v created=%v err=%v", replay, created, err)
 	}
 	// New reservations stay blocked by the persisted, already-expired window.
-	_, _, err = restarted.CreateReservation(ctx, id, "res-1", 1)
+	_, _, err = restarted.CreateReservation(ctx, id, "res-1", "dept-1", 1)
 	wantCode(t, err, CodeEntitlementNotActive)
+}
+
+func createSeatEntitlement(t *testing.T, store *Store, seats, quota int64) string {
+	t.Helper()
+	from, to := activeWindow()
+	id := uniqueID(t)
+	if _, err := store.CreateEntitlement(context.Background(), CreateEntitlementInput{
+		EntitlementID: id, SeatsTotal: ptr(seats), QuotaTotal: ptr(quota), ValidFrom: from, ValidTo: to,
+	}); err != nil {
+		t.Fatalf("create entitlement: %v", err)
+	}
+	return id
+}
+
+func TestSeatAdjustmentValidation(t *testing.T) {
+	store := testStore(t)
+	id := createSeatEntitlement(t, store, 100, 100)
+	ctx := context.Background()
+
+	// Zero delta and an illegal identifier are rejected before any write.
+	_, _, err := store.CreateSeatAdjustment(ctx, id, "seat-1", 0)
+	wantCode(t, err, CodeInvalidRequest)
+	_, _, err = store.CreateSeatAdjustment(ctx, id, "bad id!", 10)
+	wantCode(t, err, CodeInvalidRequest)
+	// An unknown entitlement is a distinct failure.
+	_, _, err = store.CreateSeatAdjustment(ctx, "ent-404", "seat-1", 10)
+	wantCode(t, err, CodeEntitlementNotFound)
+	// A decrease to zero or below fails and writes nothing.
+	_, _, err = store.CreateSeatAdjustment(ctx, id, "seat-zero", -100)
+	wantCode(t, err, CodeInsufficientQuota)
+	_, _, err = store.CreateSeatAdjustment(ctx, id, "seat-below", -150)
+	wantCode(t, err, CodeInsufficientQuota)
+
+	view, err := store.GetView(ctx, id)
+	if err != nil {
+		t.Fatalf("view: %v", err)
+	}
+	if view.SeatsTotal != 100 || len(view.SeatAdjustments) != 0 {
+		t.Fatalf("failed seat adjustments left partial state: %+v", view)
+	}
+}
+
+func TestSeatAdjustmentIdempotency(t *testing.T) {
+	store := testStore(t)
+	id := createSeatEntitlement(t, store, 100, 100)
+	ctx := context.Background()
+
+	first, created, err := store.CreateSeatAdjustment(ctx, id, "seat-1", 40)
+	if err != nil || !created || first.SeatTotal != 140 || first.CreatedAt.IsZero() {
+		t.Fatalf("first seat adjustment: %+v created=%v err=%v", first, created, err)
+	}
+	view, _ := store.GetView(ctx, id)
+	if view.SeatsTotal != 140 || len(view.SeatAdjustments) != 1 {
+		t.Fatalf("seat total did not move immediately: %+v", view)
+	}
+
+	// The same identifier with the same delta returns the original result and
+	// does not move the seat total again.
+	replay, created, err := store.CreateSeatAdjustment(ctx, id, "seat-1", 40)
+	if err != nil || created {
+		t.Fatalf("replay: %+v created=%v err=%v", replay, created, err)
+	}
+	if replay.SeatAdjustmentID != first.SeatAdjustmentID || replay.Delta != first.Delta ||
+		replay.SeatTotal != first.SeatTotal || !replay.CreatedAt.Equal(first.CreatedAt) {
+		t.Fatalf("replay should return the original: %+v vs %+v", replay, first)
+	}
+	view, _ = store.GetView(ctx, id)
+	if view.SeatsTotal != 140 || len(view.SeatAdjustments) != 1 {
+		t.Fatalf("replay moved the seat total again: %+v", view)
+	}
+
+	// The same identifier with a different delta fails and changes nothing.
+	_, _, err = store.CreateSeatAdjustment(ctx, id, "seat-1", 50)
+	wantCode(t, err, CodeSeatAdjustmentChanged)
+	view, _ = store.GetView(ctx, id)
+	if view.SeatsTotal != 140 || len(view.SeatAdjustments) != 1 ||
+		view.SeatAdjustments[0].Delta != 40 || view.SeatAdjustments[0].SeatTotal != 140 {
+		t.Fatalf("param mismatch changed state: %+v", view)
+	}
+}
+
+func TestSeatAdjustmentCumulativeList(t *testing.T) {
+	store := testStore(t)
+	id := createSeatEntitlement(t, store, 100, 100)
+	ctx := context.Background()
+
+	want := []struct {
+		id    string
+		delta int64
+		total int64
+	}{
+		{"sa-1", 50, 150},
+		{"sa-2", -20, 130},
+		{"sa-3", 5, 135},
+	}
+	for _, w := range want {
+		got, created, err := store.CreateSeatAdjustment(ctx, id, w.id, w.delta)
+		if err != nil || !created || got.SeatTotal != w.total {
+			t.Fatalf("seat adjustment %s: %+v created=%v err=%v", w.id, got, created, err)
+		}
+	}
+	view, err := store.GetView(ctx, id)
+	if err != nil {
+		t.Fatalf("view: %v", err)
+	}
+	if view.SeatsTotal != 135 || len(view.SeatAdjustments) != 3 {
+		t.Fatalf("seat state: %+v", view)
+	}
+	for i, w := range want {
+		entry := view.SeatAdjustments[i]
+		if entry.SeatAdjustmentID != w.id || entry.Delta != w.delta || entry.SeatTotal != w.total ||
+			entry.CreatedAt.IsZero() {
+			t.Fatalf("seat adjustment entry %d: %+v", i, entry)
+		}
+	}
+}
+
+func TestSeatDecreaseBlockedByAllocatedSeats(t *testing.T) {
+	store := testStore(t)
+	// Seats and quota are independent figures: give plenty of quota so only
+	// the seat occupancy rule is under test here.
+	id := createSeatEntitlement(t, store, 100, 500)
+	ctx := context.Background()
+
+	// Allocate 60 seats to departments: 30 still held, 30 confirmed.
+	if _, _, err := store.CreateReservation(ctx, id, "res-hold", "dept-a", 30); err != nil {
+		t.Fatalf("reserve hold: %v", err)
+	}
+	if _, _, err := store.CreateReservation(ctx, id, "res-used", "dept-b", 30); err != nil {
+		t.Fatalf("reserve used: %v", err)
+	}
+	if _, err := store.SettleReservation(ctx, id, "res-used", ActionConfirm); err != nil {
+		t.Fatalf("confirm: %v", err)
+	}
+
+	// Recovering 40 down to exactly the 60 allocated seats is allowed.
+	if _, created, err := store.CreateSeatAdjustment(ctx, id, "seat-cut", -40); err != nil || !created {
+		t.Fatalf("decrease to occupancy boundary: created=%v err=%v", created, err)
+	}
+	// One more seat would crowd out an allocation: the request fails and
+	// writes neither a record nor a new total.
+	_, _, err := store.CreateSeatAdjustment(ctx, id, "seat-crowd", -1)
+	wantCode(t, err, CodeInsufficientQuota)
+	view, _ := store.GetView(ctx, id)
+	if view.SeatsTotal != 60 || len(view.SeatAdjustments) != 1 {
+		t.Fatalf("blocked decrease changed state: %+v", view)
+	}
+
+	// Releasing the held 30 frees them for recovery; the confirmed 30 stay
+	// allocated, so the floor drops to 30.
+	if _, err := store.SettleReservation(ctx, id, "res-hold", ActionRelease); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if _, _, err := store.CreateSeatAdjustment(ctx, id, "seat-cut-2", -20); err != nil {
+		t.Fatalf("decrease after release: %v", err)
+	}
+	view, _ = store.GetView(ctx, id)
+	if view.SeatsTotal != 40 || len(view.SeatAdjustments) != 2 {
+		t.Fatalf("seat state after release: %+v", view)
+	}
+
+	// A corrective reversal leaves the original confirmation in place, so
+	// those 30 seats still count as allocated to the department.
+	if _, _, err := store.ReverseReservation(ctx, id, "res-used", "corr-1"); err != nil {
+		t.Fatalf("reverse: %v", err)
+	}
+	if _, _, err := store.CreateSeatAdjustment(ctx, id, "seat-cut-3", -11); err == nil {
+		t.Fatalf("decrease below a still-confirmed reservation should fail")
+	} else {
+		wantCode(t, err, CodeInsufficientQuota)
+	}
+	if _, _, err := store.CreateSeatAdjustment(ctx, id, "seat-cut-4", -10); err != nil {
+		t.Fatalf("decrease to the confirmed floor should be allowed: %v", err)
+	}
+	view, _ = store.GetView(ctx, id)
+	if view.SeatsTotal != 30 {
+		t.Fatalf("seat floor after reversal: %+v", view)
+	}
+}
+
+func TestSeatAdjustmentsDoNotTouchQuota(t *testing.T) {
+	store := testStore(t)
+	id := createSeatEntitlement(t, store, 100, 200)
+	ctx := context.Background()
+
+	if _, _, err := store.CreateSeatAdjustment(ctx, id, "seat-up", 50); err != nil {
+		t.Fatalf("seat increase: %v", err)
+	}
+	if _, _, err := store.CreateReservation(ctx, id, "res-1", "dept-a", 180); err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	// A quota adjustment moves quota only.
+	if _, _, err := store.CreateAdjustment(ctx, id, "quota-up", 100, time.Now().Add(-time.Minute)); err != nil {
+		t.Fatalf("quota increase: %v", err)
+	}
+	// Releasing the hold frees seat occupancy; a seat recovery then moves
+	// seats only.
+	if _, err := store.SettleReservation(ctx, id, "res-1", ActionRelease); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if _, _, err := store.CreateSeatAdjustment(ctx, id, "seat-down", -140); err != nil {
+		t.Fatalf("seat decrease: %v", err)
+	}
+
+	view, err := store.GetView(ctx, id)
+	if err != nil {
+		t.Fatalf("view: %v", err)
+	}
+	if view.SeatsTotal != 10 {
+		t.Fatalf("seats should end at 10: %+v", view)
+	}
+	if view.QuotaTotal != 300 || view.UsedAmount != 0 || view.ReservedAmount != 0 ||
+		view.AvailableAmount != 300 {
+		t.Fatalf("seat adjustments altered quota figures: %+v", view)
+	}
+}
+
+func TestReservationDepartmentIsStoredAndImmutable(t *testing.T) {
+	store := testStore(t)
+	from, to := activeWindow()
+	id := uniqueID(t)
+	mustCreate(t, store, id, 100, from, to)
+	ctx := context.Background()
+
+	created, made, err := store.CreateReservation(ctx, id, "res-1", "dept-a", 30)
+	if err != nil || !made || created.DepartmentID != "dept-a" {
+		t.Fatalf("create with department: %+v created=%v err=%v", created, made, err)
+	}
+	// Replay with the same department returns the original.
+	replay, made, err := store.CreateReservation(ctx, id, "res-1", "dept-a", 30)
+	if err != nil || made || replay.DepartmentID != "dept-a" {
+		t.Fatalf("replay: %+v created=%v err=%v", replay, made, err)
+	}
+	// The department is an immutable reservation attribute.
+	_, _, err = store.CreateReservation(ctx, id, "res-1", "dept-b", 30)
+	wantCode(t, err, CodeReservationParamChanged)
+	// A missing department is invalid input.
+	_, _, err = store.CreateReservation(ctx, id, "res-2", "", 10)
+	wantCode(t, err, CodeInvalidRequest)
+
+	view, _ := store.GetView(ctx, id)
+	if len(view.Reservations) != 1 || view.Reservations[0].DepartmentID != "dept-a" {
+		t.Fatalf("department not preserved in view: %+v", view.Reservations)
+	}
+	if view.ReservedAmount != 30 {
+		t.Fatalf("failed calls changed state: %+v", view)
+	}
+}
+
+func TestConcurrentSeatAdjustmentsApplyOnce(t *testing.T) {
+	store := testStore(t)
+	id := createSeatEntitlement(t, store, 1000, 1000)
+	ctx := context.Background()
+
+	const workers = 8
+	var wg sync.WaitGroup
+	results := make(chan error, workers*3)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			sid := fmt.Sprintf("seat-%d", w)
+			// Each worker submits one increase, replays it, then submits a
+			// decrease; replays and first submissions race across workers.
+			_, _, err := store.CreateSeatAdjustment(ctx, id, sid, 5)
+			results <- err
+			_, _, err = store.CreateSeatAdjustment(ctx, id, sid, 5)
+			results <- err
+			_, _, err = store.CreateSeatAdjustment(ctx, id, fmt.Sprintf("seat-back-%d", w), -2)
+			results <- err
+		}(w)
+	}
+	wg.Wait()
+	close(results)
+	for err := range results {
+		if err != nil {
+			t.Fatalf("unexpected concurrent failure: %v", err)
+		}
+	}
+	view, err := store.GetView(ctx, id)
+	if err != nil {
+		t.Fatalf("view: %v", err)
+	}
+	if view.SeatsTotal != 1000+workers*3 || len(view.SeatAdjustments) != workers*2 {
+		t.Fatalf("concurrent seat adjustments broke state: %+v", view)
+	}
+	var summed int64
+	for _, sa := range view.SeatAdjustments {
+		summed += sa.Delta
+	}
+	if summed != workers*3 || view.SeatsTotal != 1000+summed {
+		t.Fatalf("cumulative totals inconsistent: %+v", view)
+	}
+}
+
+func TestConcurrentSeatAdjustmentsAndReservations(t *testing.T) {
+	store := testStore(t)
+	id := createSeatEntitlement(t, store, 1000, 5000)
+	ctx := context.Background()
+
+	const workers = 8
+	var wg sync.WaitGroup
+	errs := make(chan error, workers*4)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			rid := fmt.Sprintf("res-%d", w)
+			if _, _, err := store.CreateReservation(ctx, id, rid, "dept-a", 5); err != nil {
+				errs <- err
+				return
+			}
+			// Seat allocations and recoveries interleave with reservation
+			// lifecycle operations on the same row lock.
+			if _, _, err := store.CreateSeatAdjustment(ctx, id, fmt.Sprintf("seat-up-%d", w), 10); err != nil {
+				errs <- err
+			}
+			if w%2 == 0 {
+				_, _ = store.SettleReservation(ctx, id, rid, ActionConfirm)
+			} else {
+				_, _ = store.SettleReservation(ctx, id, rid, ActionRelease)
+			}
+			// 5 seats per worker stay allocated when confirmed, so recovering
+			// the 10 just added per worker is always feasible.
+			if _, _, err := store.CreateSeatAdjustment(ctx, id, fmt.Sprintf("seat-down-%d", w), -10); err != nil {
+				errs <- err
+			}
+		}(w)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("unexpected concurrent failure: %v", err)
+	}
+	view, err := store.GetView(ctx, id)
+	if err != nil {
+		t.Fatalf("view: %v", err)
+	}
+	var allocated int64
+	for _, r := range view.Reservations {
+		if r.Status != StatusReleased {
+			allocated += r.Amount
+		}
+	}
+	if view.SeatsTotal != 1000 || view.SeatsTotal < allocated {
+		t.Fatalf("seat invariant violated: seats=%d allocated=%d view=%+v",
+			view.SeatsTotal, allocated, view)
+	}
+}
+
+func TestSeatAdjustmentsSurviveReconnection(t *testing.T) {
+	store := testStore(t)
+	id := createSeatEntitlement(t, store, 100, 100)
+	ctx := context.Background()
+	if _, _, err := store.CreateSeatAdjustment(ctx, id, "seat-1", 50); err != nil {
+		t.Fatalf("seat increase: %v", err)
+	}
+	if _, _, err := store.CreateSeatAdjustment(ctx, id, "seat-2", -20); err != nil {
+		t.Fatalf("seat decrease: %v", err)
+	}
+	if _, _, err := store.CreateReservation(ctx, id, "res-1", "dept-a", 30); err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+
+	// A fresh pool over the same database simulates a service restart.
+	pool, err := pgxpool.New(ctx, os.Getenv("TEST_DATABASE_URL"))
+	if err != nil {
+		t.Fatalf("reconnect: %v", err)
+	}
+	defer pool.Close()
+	restarted := NewStore(pool)
+	view, err := restarted.GetView(ctx, id)
+	if err != nil {
+		t.Fatalf("view after restart: %v", err)
+	}
+	if view.SeatsTotal != 130 || len(view.SeatAdjustments) != 2 {
+		t.Fatalf("seat state lost across restart: %+v", view)
+	}
+	if view.SeatAdjustments[0].SeatTotal != 150 || view.SeatAdjustments[1].SeatTotal != 130 {
+		t.Fatalf("cumulative totals lost across restart: %+v", view.SeatAdjustments)
+	}
+	if len(view.Reservations) != 1 || view.Reservations[0].DepartmentID != "dept-a" {
+		t.Fatalf("department lost across restart: %+v", view.Reservations)
+	}
+	// The identifier is still replayed, not re-applied; the allocation floor
+	// still protects departments after the restart.
+	replay, created, err := restarted.CreateSeatAdjustment(ctx, id, "seat-2", -20)
+	if err != nil || created || replay.SeatTotal != 130 {
+		t.Fatalf("seat adjustment replay after restart: %+v created=%v err=%v", replay, created, err)
+	}
+	_, _, err = restarted.CreateSeatAdjustment(ctx, id, "seat-crowd", -101)
+	wantCode(t, err, CodeInsufficientQuota)
 }
