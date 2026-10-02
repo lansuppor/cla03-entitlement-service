@@ -21,6 +21,8 @@ type Service interface {
 	CreateSeatAdjustment(ctx context.Context, entitlementID, seatAdjustmentID string, delta int64) (entitlements.SeatAdjustment, bool, error)
 	PauseEntitlement(ctx context.Context, entitlementID, eventID string, at time.Time) (entitlements.PauseResumeEvent, bool, error)
 	ResumeEntitlement(ctx context.Context, entitlementID, eventID string, at time.Time) (entitlements.PauseResumeEvent, bool, error)
+	CreateDepartmentAllocation(ctx context.Context, entitlementID, allocationID, departmentID string, amount int64) (entitlements.DepartmentRecord, bool, error)
+	CreateDepartmentReturn(ctx context.Context, entitlementID, returnID, departmentID string, amount int64) (entitlements.DepartmentRecord, bool, error)
 	GetView(ctx context.Context, entitlementID string) (entitlements.View, error)
 }
 
@@ -51,6 +53,8 @@ func New(checkDatabase func(context.Context) error, service Service) http.Handle
 	mux.HandleFunc("POST /entitlements/{entitlementID}/seat-adjustments", h.createSeatAdjustment)
 	mux.HandleFunc("POST /entitlements/{entitlementID}/pauses", h.pauseEntitlement)
 	mux.HandleFunc("POST /entitlements/{entitlementID}/resumes", h.resumeEntitlement)
+	mux.HandleFunc("POST /entitlements/{entitlementID}/department-allocations", h.createDepartmentAllocation)
+	mux.HandleFunc("POST /entitlements/{entitlementID}/department-returns", h.createDepartmentReturn)
 	return mux
 }
 
@@ -339,6 +343,68 @@ func (h *handlers) resumeEntitlement(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, status, event)
 }
 
+type createDepartmentAllocationRequest struct {
+	AllocationID string `json:"allocation_id"`
+	DepartmentID string `json:"department_id"`
+	Amount       *int64 `json:"amount"`
+}
+
+func (h *handlers) createDepartmentAllocation(w http.ResponseWriter, r *http.Request) {
+	var req createDepartmentAllocationRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	if req.Amount == nil {
+		respondError(w, &entitlements.Error{
+			Code:    entitlements.CodeInvalidRequest,
+			Message: "amount is required and must be a positive integer",
+		})
+		return
+	}
+	record, created, err := h.service.CreateDepartmentAllocation(
+		r.Context(), r.PathValue("entitlementID"), req.AllocationID, req.DepartmentID, *req.Amount)
+	if err != nil {
+		respondError(w, err)
+		return
+	}
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	respondJSON(w, status, record)
+}
+
+type createDepartmentReturnRequest struct {
+	ReturnID     string `json:"return_id"`
+	DepartmentID string `json:"department_id"`
+	Amount       *int64 `json:"amount"`
+}
+
+func (h *handlers) createDepartmentReturn(w http.ResponseWriter, r *http.Request) {
+	var req createDepartmentReturnRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	if req.Amount == nil {
+		respondError(w, &entitlements.Error{
+			Code:    entitlements.CodeInvalidRequest,
+			Message: "amount is required and must be a positive integer",
+		})
+		return
+	}
+	record, created, err := h.service.CreateDepartmentReturn(
+		r.Context(), r.PathValue("entitlementID"), req.ReturnID, req.DepartmentID, *req.Amount)
+	if err != nil {
+		respondError(w, err)
+		return
+	}
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	respondJSON(w, status, record)
+}
+
 // decode parses a JSON request body strictly; on failure it writes the error
 // response and returns false.
 func decode(w http.ResponseWriter, r *http.Request, target any) bool {
@@ -374,6 +440,8 @@ var errorStatus = map[string]int{
 	entitlements.CodeEntitlementAlreadyPaused: http.StatusConflict,
 	entitlements.CodeEntitlementNotPaused:     http.StatusConflict,
 	entitlements.CodeEntitlementPaused:        http.StatusUnprocessableEntity,
+	entitlements.CodeAllocationParamChanged:   http.StatusConflict,
+	entitlements.CodeReturnParamChanged:       http.StatusConflict,
 }
 
 func respondError(w http.ResponseWriter, err error) {

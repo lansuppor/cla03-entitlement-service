@@ -2133,3 +2133,451 @@ func TestPauseResumeSurviveReconnection(t *testing.T) {
 		t.Fatalf("reserve after resumed restart: %v", err)
 	}
 }
+
+func TestDepartmentAllocationValidation(t *testing.T) {
+	store := testStore(t)
+	id := createSeatEntitlement(t, store, 100, 100)
+	ctx := context.Background()
+
+	// Missing/illegal identifiers and non-positive amounts are rejected
+	// before any write.
+	for _, tc := range []struct {
+		name                       string
+		allocationID, departmentID string
+		amount                     int64
+	}{
+		{"empty allocation id", "", "dept-1", 10},
+		{"bad allocation id chars", "bad id!", "dept-1", 10},
+		{"empty department id", "alloc-1", "", 10},
+		{"bad department id chars", "alloc-1", "dept 1!", 10},
+		{"zero amount", "alloc-1", "dept-1", 0},
+		{"negative amount", "alloc-1", "dept-1", -5},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, err := store.CreateDepartmentAllocation(ctx, id, tc.allocationID, tc.departmentID, tc.amount)
+			wantCode(t, err, CodeInvalidRequest)
+		})
+	}
+	// Returns validate the same way, and an unknown entitlement is a
+	// distinct failure for both kinds.
+	_, _, err := store.CreateDepartmentReturn(ctx, id, "ret-1", "dept-1", 0)
+	wantCode(t, err, CodeInvalidRequest)
+	_, _, err = store.CreateDepartmentReturn(ctx, id, "ret-1", "bad id!", 5)
+	wantCode(t, err, CodeInvalidRequest)
+	_, _, err = store.CreateDepartmentAllocation(ctx, "ent-404", "alloc-1", "dept-1", 10)
+	wantCode(t, err, CodeEntitlementNotFound)
+	_, _, err = store.CreateDepartmentReturn(ctx, "ent-404", "ret-1", "dept-1", 10)
+	wantCode(t, err, CodeEntitlementNotFound)
+
+	view, err := store.GetView(ctx, id)
+	if err != nil {
+		t.Fatalf("view: %v", err)
+	}
+	if len(view.DepartmentRecords) != 0 || len(view.DepartmentAccounts) != 0 {
+		t.Fatalf("failed requests left partial state: %+v", view)
+	}
+}
+
+func TestDepartmentAllocationIdempotency(t *testing.T) {
+	store := testStore(t)
+	id := createSeatEntitlement(t, store, 100, 100)
+	ctx := context.Background()
+
+	first, created, err := store.CreateDepartmentAllocation(ctx, id, "alloc-1", "dept-1", 30)
+	if err != nil || !created || first.Kind != KindAllocation || first.CreatedAt.IsZero() {
+		t.Fatalf("first allocation: %+v created=%v err=%v", first, created, err)
+	}
+
+	// The same identifier with the same parameters returns the original
+	// record and does not occupy free quota again.
+	replay, created, err := store.CreateDepartmentAllocation(ctx, id, "alloc-1", "dept-1", 30)
+	if err != nil || created {
+		t.Fatalf("replay: %+v created=%v err=%v", replay, created, err)
+	}
+	if replay.RecordID != first.RecordID || replay.DepartmentID != first.DepartmentID ||
+		replay.Amount != first.Amount || !replay.CreatedAt.Equal(first.CreatedAt) {
+		t.Fatalf("replay should return the original: %+v vs %+v", replay, first)
+	}
+
+	// The same identifier with a different amount or department fails and
+	// changes nothing.
+	_, _, err = store.CreateDepartmentAllocation(ctx, id, "alloc-1", "dept-1", 40)
+	wantCode(t, err, CodeAllocationParamChanged)
+	_, _, err = store.CreateDepartmentAllocation(ctx, id, "alloc-1", "dept-2", 30)
+	wantCode(t, err, CodeAllocationParamChanged)
+
+	view, err := store.GetView(ctx, id)
+	if err != nil {
+		t.Fatalf("view: %v", err)
+	}
+	if len(view.DepartmentRecords) != 1 || len(view.DepartmentAccounts) != 1 {
+		t.Fatalf("department ledger: %+v", view)
+	}
+	account := view.DepartmentAccounts[0]
+	if account.DepartmentID != "dept-1" || account.HeldAmount != 30 ||
+		account.AllocatedAmount != 30 || account.ReturnedAmount != 0 {
+		t.Fatalf("department account: %+v", account)
+	}
+}
+
+func TestDepartmentAllocationFreeQuota(t *testing.T) {
+	store := testStore(t)
+	id := createSeatEntitlement(t, store, 100, 100)
+	ctx := context.Background()
+
+	if _, _, err := store.CreateDepartmentAllocation(ctx, id, "alloc-a", "dept-a", 70); err != nil {
+		t.Fatalf("allocate 70: %v", err)
+	}
+	// Only 30 of the 100 quota is still free: 40 fails and writes nothing.
+	_, _, err := store.CreateDepartmentAllocation(ctx, id, "alloc-b", "dept-b", 40)
+	wantCode(t, err, CodeInsufficientQuota)
+	if _, _, err := store.CreateDepartmentAllocation(ctx, id, "alloc-b", "dept-b", 30); err != nil {
+		t.Fatalf("allocate 30: %v", err)
+	}
+	// The free pool is exhausted now.
+	_, _, err = store.CreateDepartmentAllocation(ctx, id, "alloc-c", "dept-c", 1)
+	wantCode(t, err, CodeInsufficientQuota)
+
+	// A return frees quota, and the freed quota can be allocated again.
+	if _, _, err := store.CreateDepartmentReturn(ctx, id, "ret-a", "dept-a", 10); err != nil {
+		t.Fatalf("return 10: %v", err)
+	}
+	if _, _, err := store.CreateDepartmentAllocation(ctx, id, "alloc-c", "dept-c", 10); err != nil {
+		t.Fatalf("re-allocate returned quota: %v", err)
+	}
+	_, _, err = store.CreateDepartmentAllocation(ctx, id, "alloc-d", "dept-c", 1)
+	wantCode(t, err, CodeInsufficientQuota)
+
+	view, err := store.GetView(ctx, id)
+	if err != nil {
+		t.Fatalf("view: %v", err)
+	}
+	// The department ledger never moves a quota figure.
+	if view.QuotaTotal != 100 || view.UsedAmount != 0 || view.ReservedAmount != 0 ||
+		view.AvailableAmount != 100 || view.SeatsTotal != 100 {
+		t.Fatalf("department records moved quota figures: %+v", view)
+	}
+	var heldTotal int64
+	for _, account := range view.DepartmentAccounts {
+		heldTotal += account.HeldAmount
+	}
+	if heldTotal != 100 || len(view.DepartmentRecords) != 4 {
+		t.Fatalf("department ledger inconsistent: accounts=%+v records=%+v",
+			view.DepartmentAccounts, view.DepartmentRecords)
+	}
+}
+
+func TestDepartmentReturnIdempotency(t *testing.T) {
+	store := testStore(t)
+	id := createSeatEntitlement(t, store, 100, 100)
+	ctx := context.Background()
+
+	if _, _, err := store.CreateDepartmentAllocation(ctx, id, "alloc-1", "dept-1", 50); err != nil {
+		t.Fatalf("allocate: %v", err)
+	}
+	first, created, err := store.CreateDepartmentReturn(ctx, id, "ret-1", "dept-1", 20)
+	if err != nil || !created || first.Kind != KindReturn || first.Amount != 20 {
+		t.Fatalf("first return: %+v created=%v err=%v", first, created, err)
+	}
+
+	// The same identifier with the same parameters returns the original
+	// record and does not free the quota again.
+	replay, created, err := store.CreateDepartmentReturn(ctx, id, "ret-1", "dept-1", 20)
+	if err != nil || created {
+		t.Fatalf("replay: %+v created=%v err=%v", replay, created, err)
+	}
+	if replay.RecordID != first.RecordID || !replay.CreatedAt.Equal(first.CreatedAt) {
+		t.Fatalf("replay should return the original: %+v vs %+v", replay, first)
+	}
+
+	// The same identifier with different parameters fails and changes
+	// nothing.
+	_, _, err = store.CreateDepartmentReturn(ctx, id, "ret-1", "dept-1", 30)
+	wantCode(t, err, CodeReturnParamChanged)
+	_, _, err = store.CreateDepartmentReturn(ctx, id, "ret-1", "dept-2", 20)
+	wantCode(t, err, CodeReturnParamChanged)
+
+	// Allocation and return identifiers live in separate namespaces.
+	if _, _, err := store.CreateDepartmentReturn(ctx, id, "alloc-1", "dept-1", 10); err != nil {
+		t.Fatalf("return reusing an allocation identifier: %v", err)
+	}
+
+	view, err := store.GetView(ctx, id)
+	if err != nil {
+		t.Fatalf("view: %v", err)
+	}
+	if len(view.DepartmentAccounts) != 1 {
+		t.Fatalf("accounts: %+v", view.DepartmentAccounts)
+	}
+	account := view.DepartmentAccounts[0]
+	if account.HeldAmount != 20 || account.AllocatedAmount != 50 || account.ReturnedAmount != 30 {
+		t.Fatalf("account after returns: %+v", account)
+	}
+}
+
+func TestDepartmentReturnBelowZero(t *testing.T) {
+	store := testStore(t)
+	id := createSeatEntitlement(t, store, 100, 100)
+	ctx := context.Background()
+
+	if _, _, err := store.CreateDepartmentAllocation(ctx, id, "alloc-1", "dept-a", 20); err != nil {
+		t.Fatalf("allocate: %v", err)
+	}
+	// Returning more than the department holds fails and writes nothing.
+	_, _, err := store.CreateDepartmentReturn(ctx, id, "ret-over", "dept-a", 25)
+	wantCode(t, err, CodeInsufficientQuota)
+	// A department that never received an allocation holds nothing.
+	_, _, err = store.CreateDepartmentReturn(ctx, id, "ret-unknown", "dept-b", 1)
+	wantCode(t, err, CodeInsufficientQuota)
+	// Returning exactly the held amount is allowed; one more is not.
+	if _, _, err := store.CreateDepartmentReturn(ctx, id, "ret-all", "dept-a", 20); err != nil {
+		t.Fatalf("return all: %v", err)
+	}
+	_, _, err = store.CreateDepartmentReturn(ctx, id, "ret-past-zero", "dept-a", 1)
+	wantCode(t, err, CodeInsufficientQuota)
+
+	view, err := store.GetView(ctx, id)
+	if err != nil {
+		t.Fatalf("view: %v", err)
+	}
+	if len(view.DepartmentRecords) != 2 || len(view.DepartmentAccounts) != 1 {
+		t.Fatalf("failed returns left partial state: %+v", view)
+	}
+	account := view.DepartmentAccounts[0]
+	if account.DepartmentID != "dept-a" || account.HeldAmount != 0 ||
+		account.AllocatedAmount != 20 || account.ReturnedAmount != 20 {
+		t.Fatalf("account: %+v", account)
+	}
+}
+
+func TestDepartmentRecordsDoNotTouchQuota(t *testing.T) {
+	store := testStore(t)
+	id := createSeatEntitlement(t, store, 100, 100)
+	ctx := context.Background()
+
+	// Occupy 40 quota with a reservation; the department ledger is
+	// independent of reservations, so the full quota total stays allocatable.
+	if _, _, err := store.CreateReservation(ctx, id, "res-1", "dept-ops", 40); err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	if _, _, err := store.CreateDepartmentAllocation(ctx, id, "alloc-1", "dept-1", 100); err != nil {
+		t.Fatalf("allocate full total alongside a reservation: %v", err)
+	}
+	if _, err := store.SettleReservation(ctx, id, "res-1", ActionConfirm); err != nil {
+		t.Fatalf("confirm: %v", err)
+	}
+	if _, _, err := store.CreateDepartmentReturn(ctx, id, "ret-1", "dept-1", 100); err != nil {
+		t.Fatalf("return: %v", err)
+	}
+
+	view, err := store.GetView(ctx, id)
+	if err != nil {
+		t.Fatalf("view: %v", err)
+	}
+	if view.QuotaTotal != 100 || view.UsedAmount != 40 || view.ReservedAmount != 0 ||
+		view.AvailableAmount != 60 {
+		t.Fatalf("department records changed quota figures: %+v", view)
+	}
+	// The allocation created no reservation and no other business record.
+	if len(view.Reservations) != 1 || len(view.Adjustments) != 0 ||
+		len(view.SeatAdjustments) != 0 || len(view.Reschedules) != 0 {
+		t.Fatalf("department records leaked into other lists: %+v", view)
+	}
+}
+
+func TestDepartmentAccountsAndRecordsInView(t *testing.T) {
+	store := testStore(t)
+	id := createSeatEntitlement(t, store, 100, 100)
+	ctx := context.Background()
+
+	if _, _, err := store.CreateDepartmentAllocation(ctx, id, "alloc-x", "dept-x", 50); err != nil {
+		t.Fatalf("allocate x: %v", err)
+	}
+	if _, _, err := store.CreateDepartmentAllocation(ctx, id, "alloc-y", "dept-y", 30); err != nil {
+		t.Fatalf("allocate y: %v", err)
+	}
+	if _, _, err := store.CreateDepartmentReturn(ctx, id, "ret-x", "dept-x", 20); err != nil {
+		t.Fatalf("return x: %v", err)
+	}
+
+	view, err := store.GetView(ctx, id)
+	if err != nil {
+		t.Fatalf("view: %v", err)
+	}
+	// The record list preserves creation order and carries the business
+	// identifier, department, amount, type and creation time of each entry.
+	if len(view.DepartmentRecords) != 3 {
+		t.Fatalf("records: %+v", view.DepartmentRecords)
+	}
+	want := []DepartmentRecord{
+		{RecordID: "alloc-x", DepartmentID: "dept-x", Amount: 50, Kind: KindAllocation},
+		{RecordID: "alloc-y", DepartmentID: "dept-y", Amount: 30, Kind: KindAllocation},
+		{RecordID: "ret-x", DepartmentID: "dept-x", Amount: 20, Kind: KindReturn},
+	}
+	for i, w := range want {
+		got := view.DepartmentRecords[i]
+		if got.RecordID != w.RecordID || got.DepartmentID != w.DepartmentID ||
+			got.Amount != w.Amount || got.Kind != w.Kind || got.CreatedAt.IsZero() {
+			t.Fatalf("record %d: want %+v, got %+v", i, w, got)
+		}
+	}
+	// The accounts give held and cumulative figures per department.
+	if len(view.DepartmentAccounts) != 2 {
+		t.Fatalf("accounts: %+v", view.DepartmentAccounts)
+	}
+	if a := view.DepartmentAccounts[0]; a.DepartmentID != "dept-x" || a.HeldAmount != 30 ||
+		a.AllocatedAmount != 50 || a.ReturnedAmount != 20 {
+		t.Fatalf("dept-x account: %+v", a)
+	}
+	if a := view.DepartmentAccounts[1]; a.DepartmentID != "dept-y" || a.HeldAmount != 30 ||
+		a.AllocatedAmount != 30 || a.ReturnedAmount != 0 {
+		t.Fatalf("dept-y account: %+v", a)
+	}
+}
+
+func TestDepartmentRecordsAfterClosure(t *testing.T) {
+	store := testStore(t)
+	id := createSeatEntitlement(t, store, 100, 100)
+	ctx := context.Background()
+
+	if _, _, err := store.CreateDepartmentAllocation(ctx, id, "alloc-1", "dept-1", 40); err != nil {
+		t.Fatalf("allocate: %v", err)
+	}
+	expireEntitlement(t, store, id)
+	view, err := store.GetView(ctx, id)
+	if err != nil || view.Status != StatusClosed {
+		t.Fatalf("not closed: %+v err=%v", view, err)
+	}
+
+	// A closed entitlement grants no further department quota, but an
+	// identical replay still returns the original record.
+	_, _, err = store.CreateDepartmentAllocation(ctx, id, "alloc-2", "dept-1", 10)
+	wantCode(t, err, CodeEntitlementClosed)
+	replay, created, err := store.CreateDepartmentAllocation(ctx, id, "alloc-1", "dept-1", 40)
+	if err != nil || created || replay.Amount != 40 {
+		t.Fatalf("replay after closure: %+v created=%v err=%v", replay, created, err)
+	}
+	// Returns, like settlement, stay allowed after closure.
+	if _, created, err := store.CreateDepartmentReturn(ctx, id, "ret-1", "dept-1", 15); err != nil || !created {
+		t.Fatalf("return after closure: created=%v err=%v", created, err)
+	}
+
+	view, err = store.GetView(ctx, id)
+	if err != nil {
+		t.Fatalf("view: %v", err)
+	}
+	if len(view.DepartmentRecords) != 2 || view.DepartmentAccounts[0].HeldAmount != 25 {
+		t.Fatalf("department ledger after closure: %+v", view)
+	}
+}
+
+func TestConcurrentDepartmentAllocations(t *testing.T) {
+	store := testStore(t)
+	id := createSeatEntitlement(t, store, 1000, 1000)
+	ctx := context.Background()
+
+	// Eight workers allocate 100 each, replaying their own identifier:
+	// replays and first submissions race, every allocation applies once.
+	const workers = 8
+	var wg sync.WaitGroup
+	errs := make(chan error, workers*2)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			aid := fmt.Sprintf("alloc-%d", w)
+			_, _, err := store.CreateDepartmentAllocation(ctx, id, aid, "dept-c", 100)
+			errs <- err
+			_, _, err = store.CreateDepartmentAllocation(ctx, id, aid, "dept-c", 100)
+			errs <- err
+		}(w)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("unexpected concurrent failure: %v", err)
+		}
+	}
+
+	// A second wave demands more than the 200 still free: exactly two of
+	// the eight further allocations succeed, the rest fail atomically.
+	errs = make(chan error, workers)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			_, _, err := store.CreateDepartmentAllocation(ctx, id, fmt.Sprintf("extra-%d", w), "dept-c", 100)
+			errs <- err
+		}(w)
+	}
+	wg.Wait()
+	close(errs)
+	failures := 0
+	for err := range errs {
+		if err == nil {
+			continue
+		}
+		var domainErr *Error
+		if !errors.As(err, &domainErr) || domainErr.Code != CodeInsufficientQuota {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		failures++
+	}
+	if failures != workers-2 {
+		t.Fatalf("want %d insufficient-quota failures, got %d", workers-2, failures)
+	}
+
+	view, err := store.GetView(ctx, id)
+	if err != nil {
+		t.Fatalf("view: %v", err)
+	}
+	if len(view.DepartmentRecords) != workers+2 || len(view.DepartmentAccounts) != 1 ||
+		view.DepartmentAccounts[0].HeldAmount != 1000 {
+		t.Fatalf("concurrent allocations broke the ledger: %+v", view)
+	}
+}
+
+func TestDepartmentRecordsSurviveReconnection(t *testing.T) {
+	store := testStore(t)
+	id := createSeatEntitlement(t, store, 100, 100)
+	ctx := context.Background()
+	if _, _, err := store.CreateDepartmentAllocation(ctx, id, "alloc-1", "dept-1", 60); err != nil {
+		t.Fatalf("allocate: %v", err)
+	}
+	if _, _, err := store.CreateDepartmentReturn(ctx, id, "ret-1", "dept-1", 25); err != nil {
+		t.Fatalf("return: %v", err)
+	}
+
+	// A fresh pool over the same database simulates a service restart.
+	pool, err := pgxpool.New(ctx, os.Getenv("TEST_DATABASE_URL"))
+	if err != nil {
+		t.Fatalf("reconnect: %v", err)
+	}
+	defer pool.Close()
+	restarted := NewStore(pool)
+	view, err := restarted.GetView(ctx, id)
+	if err != nil {
+		t.Fatalf("view after restart: %v", err)
+	}
+	if len(view.DepartmentRecords) != 2 || len(view.DepartmentAccounts) != 1 {
+		t.Fatalf("department ledger lost across restart: %+v", view)
+	}
+	account := view.DepartmentAccounts[0]
+	if account.HeldAmount != 35 || account.AllocatedAmount != 60 || account.ReturnedAmount != 25 {
+		t.Fatalf("account after restart: %+v", account)
+	}
+	// Both identifiers are still replayed, not re-applied.
+	allocation, created, err := restarted.CreateDepartmentAllocation(ctx, id, "alloc-1", "dept-1", 60)
+	if err != nil || created || allocation.Amount != 60 {
+		t.Fatalf("allocation replay after restart: %+v created=%v err=%v", allocation, created, err)
+	}
+	returnRecord, created, err := restarted.CreateDepartmentReturn(ctx, id, "ret-1", "dept-1", 25)
+	if err != nil || created || returnRecord.Amount != 25 {
+		t.Fatalf("return replay after restart: %+v created=%v err=%v", returnRecord, created, err)
+	}
+	view, _ = restarted.GetView(ctx, id)
+	if view.DepartmentAccounts[0].HeldAmount != 35 || len(view.DepartmentRecords) != 2 {
+		t.Fatalf("replays re-applied after restart: %+v", view)
+	}
+}

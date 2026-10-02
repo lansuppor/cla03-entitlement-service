@@ -54,6 +54,7 @@ type fakeService struct {
 	reschedule     entitlements.Reschedule
 	seatAdjustment entitlements.SeatAdjustment
 	pauseResume    entitlements.PauseResumeEvent
+	department     entitlements.DepartmentRecord
 	created        bool
 	view           entitlements.View
 	err            error
@@ -65,6 +66,8 @@ type fakeService struct {
 	departmentID   string
 	pauseResumeID  string
 	pauseResumeAt  time.Time
+	recordID       string
+	amount         int64
 }
 
 func (f *fakeService) CreateEntitlement(_ context.Context, _ entitlements.CreateEntitlementInput) (entitlements.Entitlement, error) {
@@ -117,6 +120,20 @@ func (f *fakeService) ResumeEntitlement(_ context.Context, _, eventID string, at
 
 func (f *fakeService) GetView(_ context.Context, _ string) (entitlements.View, error) {
 	return f.view, f.err
+}
+
+func (f *fakeService) CreateDepartmentAllocation(_ context.Context, _, recordID, departmentID string, amount int64) (entitlements.DepartmentRecord, bool, error) {
+	f.recordID = recordID
+	f.departmentID = departmentID
+	f.amount = amount
+	return f.department, f.created, f.err
+}
+
+func (f *fakeService) CreateDepartmentReturn(_ context.Context, _, recordID, departmentID string, amount int64) (entitlements.DepartmentRecord, bool, error) {
+	f.recordID = recordID
+	f.departmentID = departmentID
+	f.amount = amount
+	return f.department, f.created, f.err
 }
 
 func serve(t *testing.T, service Service, method, path, body string) *httptest.ResponseRecorder {
@@ -172,6 +189,8 @@ func TestErrorMapping(t *testing.T) {
 		{"paused", entitlements.CodeEntitlementPaused, 422},
 		{"already paused", entitlements.CodeEntitlementAlreadyPaused, 409},
 		{"not paused", entitlements.CodeEntitlementNotPaused, 409},
+		{"allocation param mismatch", entitlements.CodeAllocationParamChanged, 409},
+		{"return param mismatch", entitlements.CodeReturnParamChanged, 409},
 		{"internal", "unmapped", 500},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -524,6 +543,97 @@ func TestPauseResumeRoutes(t *testing.T) {
 		{"/entitlements/ent-1/pauses", `{"pause_id":"p","paused_at":"2026-06-01T00:00:00Z"}`, entitlements.CodePauseResumeParamChanged, 409},
 		{"/entitlements/ent-1/resumes", `{"resume_id":"r","resumed_at":"2026-07-01T00:00:00Z"}`, entitlements.CodeEntitlementNotPaused, 409},
 		{"/entitlements/ent-1/pauses", `{"pause_id":"p","paused_at":"2026-01-01T00:00:00Z"}`, entitlements.CodeEntitlementPaused, 422},
+	} {
+		failing := &fakeService{err: &entitlements.Error{Code: tc.code, Message: "boom"}}
+		response := serve(t, failing, "POST", tc.path, tc.body)
+		if response.Code != tc.want || !strings.Contains(response.Body.String(), `"`+tc.code+`"`) {
+			t.Fatalf("code %q: status=%d body=%q", tc.code, response.Code, response.Body.String())
+		}
+	}
+}
+
+func TestDepartmentRecordRoutes(t *testing.T) {
+	allocation := entitlements.DepartmentRecord{
+		RecordID: "alloc-1", DepartmentID: "dept-9", Amount: 30,
+		Kind: entitlements.KindAllocation, CreatedAt: time.Now(),
+	}
+	service := &fakeService{department: allocation, created: true}
+	created := serve(t, service, "POST", "/entitlements/ent-1/department-allocations",
+		`{"allocation_id":"alloc-1","department_id":"dept-9","amount":30}`)
+	if created.Code != 201 || service.recordID != "alloc-1" || service.departmentID != "dept-9" || service.amount != 30 {
+		t.Fatalf("new allocation: status=%d id=%q department=%q amount=%d body=%q",
+			created.Code, service.recordID, service.departmentID, service.amount, created.Body.String())
+	}
+	if !strings.Contains(created.Body.String(), `"id":"alloc-1"`) ||
+		!strings.Contains(created.Body.String(), `"type":"allocation"`) ||
+		!strings.Contains(created.Body.String(), `"department_id":"dept-9"`) {
+		t.Fatalf("allocation body: %q", created.Body.String())
+	}
+	service.created = false
+	replayed := serve(t, service, "POST", "/entitlements/ent-1/department-allocations",
+		`{"allocation_id":"alloc-1","department_id":"dept-9","amount":30}`)
+	if replayed.Code != 200 {
+		t.Fatalf("replayed allocation: status=%d body=%q", replayed.Code, replayed.Body.String())
+	}
+
+	returnRecord := entitlements.DepartmentRecord{
+		RecordID: "ret-1", DepartmentID: "dept-9", Amount: 10,
+		Kind: entitlements.KindReturn, CreatedAt: time.Now(),
+	}
+	service = &fakeService{department: returnRecord, created: true}
+	created = serve(t, service, "POST", "/entitlements/ent-1/department-returns",
+		`{"return_id":"ret-1","department_id":"dept-9","amount":10}`)
+	if created.Code != 201 || service.recordID != "ret-1" || service.departmentID != "dept-9" || service.amount != 10 {
+		t.Fatalf("new return: status=%d id=%q department=%q amount=%d body=%q",
+			created.Code, service.recordID, service.departmentID, service.amount, created.Body.String())
+	}
+	if !strings.Contains(created.Body.String(), `"id":"ret-1"`) ||
+		!strings.Contains(created.Body.String(), `"type":"return"`) {
+		t.Fatalf("return body: %q", created.Body.String())
+	}
+	service.created = false
+	replayed = serve(t, service, "POST", "/entitlements/ent-1/department-returns",
+		`{"return_id":"ret-1","department_id":"dept-9","amount":10}`)
+	if replayed.Code != 200 {
+		t.Fatalf("replayed return: status=%d body=%q", replayed.Code, replayed.Body.String())
+	}
+
+	// A missing amount, unknown fields and malformed JSON are rejected before
+	// the domain is called; a non-positive amount or a missing identifier or
+	// department reaches the domain, which validates it.
+	for _, tc := range []struct {
+		path, body string
+	}{
+		{"/entitlements/ent-1/department-allocations", `{"allocation_id":"a1","department_id":"dept-9"}`},
+		{"/entitlements/ent-1/department-allocations", `{"allocation_id":"a1","department_id":"dept-9","amount":30,"delta":1}`},
+		{"/entitlements/ent-1/department-allocations", `{`},
+		{"/entitlements/ent-1/department-returns", `{"return_id":"r1","department_id":"dept-9"}`},
+		{"/entitlements/ent-1/department-returns", `{`},
+	} {
+		response := serve(t, service, "POST", tc.path, tc.body)
+		if response.Code != 400 || !strings.Contains(response.Body.String(), `"invalid_request"`) {
+			t.Fatalf("body %q to %s: status=%d body=%q", tc.body, tc.path, response.Code, response.Body.String())
+		}
+	}
+	invalid := &fakeService{err: &entitlements.Error{Code: entitlements.CodeInvalidRequest, Message: "bad amount"}}
+	response := serve(t, invalid, "POST", "/entitlements/ent-1/department-allocations",
+		`{"allocation_id":"a1","department_id":"dept-9","amount":0}`)
+	if response.Code != 400 || !strings.Contains(response.Body.String(), `"invalid_request"`) {
+		t.Fatalf("zero amount: status=%d body=%q", response.Code, response.Body.String())
+	}
+
+	// Domain failures keep their stable status and envelope.
+	for _, tc := range []struct {
+		path, body, code string
+		want             int
+	}{
+		{"/entitlements/ent-404/department-allocations", `{"allocation_id":"a1","department_id":"dept-9","amount":1}`, entitlements.CodeEntitlementNotFound, 404},
+		{"/entitlements/ent-1/department-allocations", `{"allocation_id":"a1","department_id":"dept-9","amount":1}`, entitlements.CodeAllocationParamChanged, 409},
+		{"/entitlements/ent-1/department-allocations", `{"allocation_id":"a1","department_id":"dept-9","amount":1}`, entitlements.CodeInsufficientQuota, 422},
+		{"/entitlements/ent-1/department-allocations", `{"allocation_id":"a1","department_id":"dept-9","amount":1}`, entitlements.CodeEntitlementClosed, 409},
+		{"/entitlements/ent-404/department-returns", `{"return_id":"r1","department_id":"dept-9","amount":1}`, entitlements.CodeEntitlementNotFound, 404},
+		{"/entitlements/ent-1/department-returns", `{"return_id":"r1","department_id":"dept-9","amount":1}`, entitlements.CodeReturnParamChanged, 409},
+		{"/entitlements/ent-1/department-returns", `{"return_id":"r1","department_id":"dept-9","amount":1}`, entitlements.CodeInsufficientQuota, 422},
 	} {
 		failing := &fakeService{err: &entitlements.Error{Code: tc.code, Message: "boom"}}
 		response := serve(t, failing, "POST", tc.path, tc.body)
