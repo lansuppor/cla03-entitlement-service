@@ -2133,3 +2133,430 @@ func TestPauseResumeSurviveReconnection(t *testing.T) {
 		t.Fatalf("reserve after resumed restart: %v", err)
 	}
 }
+
+func TestDepartmentQuotaValidation(t *testing.T) {
+	store := testStore(t)
+	from, to := activeWindow()
+	id := uniqueID(t)
+	mustCreate(t, store, id, 100, from, to)
+	ctx := context.Background()
+
+	for _, tc := range []struct {
+		name         string
+		recordID     string
+		departmentID string
+		amount       int64
+	}{
+		{"empty record id", "", "dept-a", 10},
+		{"bad record id chars", "bad id!", "dept-a", 10},
+		{"empty department", "disb-1", "", 10},
+		{"bad department chars", "disb-1", "bad dept!", 10},
+		{"zero amount", "disb-1", "dept-a", 0},
+		{"negative amount", "disb-1", "dept-a", -5},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, err := store.DisburseToDepartment(ctx, id, tc.recordID, tc.departmentID, tc.amount)
+			wantCode(t, err, CodeInvalidRequest)
+			_, _, err = store.ReturnFromDepartment(ctx, id, tc.recordID, tc.departmentID, tc.amount)
+			wantCode(t, err, CodeInvalidRequest)
+		})
+	}
+	_, _, err := store.DisburseToDepartment(ctx, "ent-missing", "disb-1", "dept-a", 10)
+	wantCode(t, err, CodeEntitlementNotFound)
+	_, _, err = store.ReturnFromDepartment(ctx, "ent-missing", "ret-1", "dept-a", 10)
+	wantCode(t, err, CodeEntitlementNotFound)
+
+	view, err := store.GetView(ctx, id)
+	if err != nil {
+		t.Fatalf("view: %v", err)
+	}
+	if len(view.DepartmentRecords) != 0 || len(view.DepartmentAccounts) != 0 {
+		t.Fatalf("invalid requests wrote department state: %+v", view)
+	}
+}
+
+func TestDisbursementIdempotencyAndFreeQuota(t *testing.T) {
+	store := testStore(t)
+	from, to := activeWindow()
+	id := uniqueID(t)
+	mustCreate(t, store, id, 100, from, to)
+	ctx := context.Background()
+
+	// 30 seats held by an in-flight reservation: available 70, all of it free.
+	if _, _, err := store.CreateReservation(ctx, id, "res-1", "dept-ops", 30); err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	first, created, err := store.DisburseToDepartment(ctx, id, "disb-1", "dept-sales", 50)
+	if err != nil || !created || first.Kind != KindDisburse || first.Amount != 50 || first.DepartmentID != "dept-sales" {
+		t.Fatalf("first disbursement: %+v created=%v err=%v", first, created, err)
+	}
+	replay, created, err := store.DisburseToDepartment(ctx, id, "disb-1", "dept-sales", 50)
+	if err != nil || created || replay != first {
+		t.Fatalf("replay should return the original: %+v created=%v err=%v", replay, created, err)
+	}
+	if _, _, err := store.DisburseToDepartment(ctx, id, "disb-1", "dept-sales", 40); err == nil {
+		t.Fatal("replay with a different amount must fail")
+	} else {
+		wantCode(t, err, CodeDisbursementParamChanged)
+	}
+	_, _, err = store.DisburseToDepartment(ctx, id, "disb-1", "dept-other", 50)
+	wantCode(t, err, CodeDisbursementParamChanged)
+	// Reusing the identifier for a return is a mismatch on the return flow.
+	_, _, err = store.ReturnFromDepartment(ctx, id, "disb-1", "dept-sales", 50)
+	wantCode(t, err, CodeReturnParamChanged)
+
+	// Free quota is available (70) minus what departments hold (50) = 20.
+	_, _, err = store.DisburseToDepartment(ctx, id, "disb-2", "dept-sales", 21)
+	wantCode(t, err, CodeInsufficientQuota)
+	if _, _, err := store.DisburseToDepartment(ctx, id, "disb-2", "dept-support", 20); err != nil {
+		t.Fatalf("disburse up to the free pool: %v", err)
+	}
+	// Confirming the reservation moves 30 to used; free quota stays 0.
+	if _, err := store.SettleReservation(ctx, id, "res-1", ActionConfirm); err != nil {
+		t.Fatalf("confirm: %v", err)
+	}
+	_, _, err = store.DisburseToDepartment(ctx, id, "disb-3", "dept-sales", 1)
+	wantCode(t, err, CodeInsufficientQuota)
+
+	view, err := store.GetView(ctx, id)
+	if err != nil {
+		t.Fatalf("view: %v", err)
+	}
+	// Disbursements occupy free quota without touching any quota figure.
+	if view.QuotaTotal != 100 || view.UsedAmount != 30 || view.ReservedAmount != 0 || view.AvailableAmount != 70 {
+		t.Fatalf("disbursements changed quota figures: %+v", view)
+	}
+	if len(view.Reservations) != 1 {
+		t.Fatalf("disbursement created a reservation: %+v", view.Reservations)
+	}
+	if len(view.DepartmentRecords) != 2 ||
+		view.DepartmentRecords[0].RecordID != "disb-1" || view.DepartmentRecords[0].Kind != KindDisburse ||
+		view.DepartmentRecords[1].RecordID != "disb-2" || view.DepartmentRecords[1].DepartmentID != "dept-support" {
+		t.Fatalf("department records missing or out of order: %+v", view.DepartmentRecords)
+	}
+	if len(view.DepartmentAccounts) != 2 {
+		t.Fatalf("department accounts: %+v", view.DepartmentAccounts)
+	}
+	sales, support := view.DepartmentAccounts[0], view.DepartmentAccounts[1]
+	if sales.DepartmentID != "dept-sales" || sales.HeldAmount != 50 || sales.DisbursedAmount != 50 || sales.ReturnedAmount != 0 {
+		t.Fatalf("dept-sales account: %+v", sales)
+	}
+	if support.DepartmentID != "dept-support" || support.HeldAmount != 20 {
+		t.Fatalf("dept-support account: %+v", support)
+	}
+}
+
+func TestReturnFlow(t *testing.T) {
+	store := testStore(t)
+	from, to := activeWindow()
+	id := uniqueID(t)
+	mustCreate(t, store, id, 100, from, to)
+	ctx := context.Background()
+
+	if _, _, err := store.DisburseToDepartment(ctx, id, "disb-a", "dept-a", 60); err != nil {
+		t.Fatalf("disburse a: %v", err)
+	}
+	if _, _, err := store.DisburseToDepartment(ctx, id, "disb-b", "dept-b", 20); err != nil {
+		t.Fatalf("disburse b: %v", err)
+	}
+
+	first, created, err := store.ReturnFromDepartment(ctx, id, "ret-1", "dept-a", 25)
+	if err != nil || !created || first.Kind != KindReturn || first.Amount != 25 {
+		t.Fatalf("first return: %+v created=%v err=%v", first, created, err)
+	}
+	replay, created, err := store.ReturnFromDepartment(ctx, id, "ret-1", "dept-a", 25)
+	if err != nil || created || replay != first {
+		t.Fatalf("replay should return the original: %+v created=%v err=%v", replay, created, err)
+	}
+	_, _, err = store.ReturnFromDepartment(ctx, id, "ret-1", "dept-a", 20)
+	wantCode(t, err, CodeReturnParamChanged)
+	_, _, err = store.ReturnFromDepartment(ctx, id, "ret-1", "dept-b", 25)
+	wantCode(t, err, CodeReturnParamChanged)
+
+	// dept-a holds 35 now; returning more than that fails and writes nothing.
+	_, _, err = store.ReturnFromDepartment(ctx, id, "ret-2", "dept-a", 36)
+	wantCode(t, err, CodeInsufficientQuota)
+	// A department that never received a disbursement cannot return.
+	_, _, err = store.ReturnFromDepartment(ctx, id, "ret-3", "dept-c", 1)
+	wantCode(t, err, CodeInsufficientQuota)
+	// Returning the exact holding is allowed and frees the quota again.
+	if _, _, err := store.ReturnFromDepartment(ctx, id, "ret-2", "dept-a", 35); err != nil {
+		t.Fatalf("return the full holding: %v", err)
+	}
+	// Returned quota is free again and can be disbursed once more.
+	if _, _, err := store.DisburseToDepartment(ctx, id, "disb-c", "dept-a", 35); err != nil {
+		t.Fatalf("re-disburse returned quota: %v", err)
+	}
+	// The free pool is back to 100-35-20 = 45.
+	_, _, err = store.DisburseToDepartment(ctx, id, "disb-d", "dept-b", 46)
+	wantCode(t, err, CodeInsufficientQuota)
+
+	view, err := store.GetView(ctx, id)
+	if err != nil {
+		t.Fatalf("view: %v", err)
+	}
+	if len(view.DepartmentRecords) != 5 {
+		t.Fatalf("failed requests left records behind: %+v", view.DepartmentRecords)
+	}
+	if len(view.DepartmentAccounts) != 2 {
+		t.Fatalf("department accounts: %+v", view.DepartmentAccounts)
+	}
+	a, b := view.DepartmentAccounts[0], view.DepartmentAccounts[1]
+	if a.DepartmentID != "dept-a" || a.HeldAmount != 35 || a.DisbursedAmount != 95 || a.ReturnedAmount != 60 {
+		t.Fatalf("dept-a account: %+v", a)
+	}
+	if b.DepartmentID != "dept-b" || b.HeldAmount != 20 || b.DisbursedAmount != 20 || b.ReturnedAmount != 0 {
+		t.Fatalf("dept-b account: %+v", b)
+	}
+	// Returns never touch the quota figures either.
+	if view.QuotaTotal != 100 || view.UsedAmount != 0 || view.ReservedAmount != 0 || view.AvailableAmount != 100 {
+		t.Fatalf("quota figures moved: %+v", view)
+	}
+}
+
+func TestDepartmentQuotaLeavesOtherFlowsUntouched(t *testing.T) {
+	store := testStore(t)
+	id := createSeatEntitlement(t, store, 100, 100)
+	ctx := context.Background()
+
+	if _, _, err := store.CreateReservation(ctx, id, "res-1", "dept-ops", 30); err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	if _, _, err := store.DisburseToDepartment(ctx, id, "disb-1", "dept-sales", 60); err != nil {
+		t.Fatalf("disburse: %v", err)
+	}
+	// The disbursement created no reservation and moved no figure.
+	view, err := store.GetView(ctx, id)
+	if err != nil {
+		t.Fatalf("view: %v", err)
+	}
+	if view.ReservedAmount != 30 || view.AvailableAmount != 70 || view.UsedAmount != 0 ||
+		view.QuotaTotal != 100 || view.SeatsTotal != 100 || len(view.Reservations) != 1 {
+		t.Fatalf("disbursement disturbed existing state: %+v", view)
+	}
+	// Settlement, reversal, quota adjustment, seat adjustment and reschedule
+	// keep their behavior with department holdings in place.
+	if _, err := store.SettleReservation(ctx, id, "res-1", ActionConfirm); err != nil {
+		t.Fatalf("confirm: %v", err)
+	}
+	if _, _, err := store.ReverseReservation(ctx, id, "res-1", "corr-1"); err != nil {
+		t.Fatalf("reverse: %v", err)
+	}
+	if _, _, err := store.CreateAdjustment(ctx, id, "adj-1", 50, time.Now().Add(-time.Minute)); err != nil {
+		t.Fatalf("adjust: %v", err)
+	}
+	if _, _, err := store.CreateSeatAdjustment(ctx, id, "seat-1", 10); err != nil {
+		t.Fatalf("seat adjust: %v", err)
+	}
+	// Reservations are bounded by the quota total, not by the free pool:
+	// 60 seats are held by departments, yet the full 150 can still be reserved.
+	if _, _, err := store.CreateReservation(ctx, id, "res-2", "dept-ops", 150); err != nil {
+		t.Fatalf("reservation ignores department holdings: %v", err)
+	}
+	// The free pool is 150 - 0 used - 150 pending - 60 held < 0, so nothing
+	// more can be disbursed.
+	_, _, err = store.DisburseToDepartment(ctx, id, "disb-2", "dept-sales", 1)
+	wantCode(t, err, CodeInsufficientQuota)
+
+	view, err = store.GetView(ctx, id)
+	if err != nil {
+		t.Fatalf("view: %v", err)
+	}
+	if view.QuotaTotal != 150 || view.SeatsTotal != 110 || view.UsedAmount != 0 || view.ReservedAmount != 150 {
+		t.Fatalf("existing flows lost their behavior: %+v", view)
+	}
+	if len(view.DepartmentAccounts) != 1 || view.DepartmentAccounts[0].HeldAmount != 60 {
+		t.Fatalf("department account changed by other flows: %+v", view.DepartmentAccounts)
+	}
+}
+
+func TestConcurrentDisbursementsNeverExceedFreeQuota(t *testing.T) {
+	store := testStore(t)
+	from, to := activeWindow()
+	id := uniqueID(t)
+	mustCreate(t, store, id, 100, from, to)
+	ctx := context.Background()
+
+	const workers = 8
+	var wg sync.WaitGroup
+	results := make(chan error, workers)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			_, _, err := store.DisburseToDepartment(ctx, id, fmt.Sprintf("disb-%d", w), "dept-a", 30)
+			results <- err
+		}(w)
+	}
+	wg.Wait()
+	close(results)
+	var succeeded int
+	for err := range results {
+		if err == nil {
+			succeeded++
+			continue
+		}
+		var domainErr *Error
+		if !errors.As(err, &domainErr) || domainErr.Code != CodeInsufficientQuota {
+			t.Fatalf("unexpected concurrent failure: %v", err)
+		}
+	}
+	if succeeded != 3 {
+		t.Fatalf("want exactly 3 successful disbursements of 30 out of 100, got %d", succeeded)
+	}
+	view, err := store.GetView(ctx, id)
+	if err != nil {
+		t.Fatalf("view: %v", err)
+	}
+	if len(view.DepartmentRecords) != 3 || len(view.DepartmentAccounts) != 1 ||
+		view.DepartmentAccounts[0].HeldAmount != 90 {
+		t.Fatalf("concurrent disbursements broke the free pool: %+v", view)
+	}
+	if view.QuotaTotal != 100 || view.UsedAmount != 0 || view.ReservedAmount != 0 || view.AvailableAmount != 100 {
+		t.Fatalf("concurrent disbursements moved quota figures: %+v", view)
+	}
+}
+
+func TestConcurrentDepartmentMovementsSerialize(t *testing.T) {
+	store := testStore(t)
+	from, to := activeWindow()
+	id := uniqueID(t)
+	mustCreate(t, store, id, 1000, from, to)
+	ctx := context.Background()
+
+	const workers = 8
+	var wg sync.WaitGroup
+	errs := make(chan error, workers*4)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			dept := fmt.Sprintf("dept-%d", w%4)
+			// Each worker disburses 10, replays it, returns 4 and replays the
+			// return; replays race first submissions across workers.
+			if _, _, err := store.DisburseToDepartment(ctx, id, fmt.Sprintf("disb-%d", w), dept, 10); err != nil {
+				errs <- err
+				return
+			}
+			if _, _, err := store.DisburseToDepartment(ctx, id, fmt.Sprintf("disb-%d", w), dept, 10); err != nil {
+				errs <- err
+			}
+			if _, _, err := store.ReturnFromDepartment(ctx, id, fmt.Sprintf("ret-%d", w), dept, 4); err != nil {
+				errs <- err
+				return
+			}
+			if _, _, err := store.ReturnFromDepartment(ctx, id, fmt.Sprintf("ret-%d", w), dept, 4); err != nil {
+				errs <- err
+			}
+		}(w)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("unexpected concurrent failure: %v", err)
+	}
+	view, err := store.GetView(ctx, id)
+	if err != nil {
+		t.Fatalf("view: %v", err)
+	}
+	// Replays never moved quota twice: 8 disbursements of 10 and 8 returns of
+	// 4 leave 48 held across 4 departments.
+	if len(view.DepartmentRecords) != workers*2 || len(view.DepartmentAccounts) != 4 {
+		t.Fatalf("replays double-applied under concurrency: %+v", view.DepartmentRecords)
+	}
+	var held int64
+	for _, account := range view.DepartmentAccounts {
+		held += account.HeldAmount
+		if account.DisbursedAmount != 20 || account.ReturnedAmount != 8 || account.HeldAmount != 12 {
+			t.Fatalf("department account inconsistent: %+v", account)
+		}
+	}
+	if held != workers*6 {
+		t.Fatalf("total held %d, want %d", held, workers*6)
+	}
+}
+
+func TestDepartmentQuotaAllowedAfterClosure(t *testing.T) {
+	store := testStore(t)
+	from, to := activeWindow()
+	id := uniqueID(t)
+	mustCreate(t, store, id, 100, from, to)
+	ctx := context.Background()
+	if _, _, err := store.DisburseToDepartment(ctx, id, "disb-1", "dept-a", 20); err != nil {
+		t.Fatalf("disburse: %v", err)
+	}
+
+	expireEntitlement(t, store, id)
+	view, err := store.GetView(ctx, id)
+	if err != nil || view.Status != StatusClosed {
+		t.Fatalf("view after expiry: status=%q err=%v", view.Status, err)
+	}
+	// Like settlement and reversal, department disbursement and return are
+	// reconciliation, not grant issuance: they stay allowed after closure.
+	if _, _, err := store.DisburseToDepartment(ctx, id, "disb-2", "dept-a", 10); err != nil {
+		t.Fatalf("disburse after closure: %v", err)
+	}
+	if _, _, err := store.ReturnFromDepartment(ctx, id, "ret-1", "dept-a", 5); err != nil {
+		t.Fatalf("return after closure: %v", err)
+	}
+	view, err = store.GetView(ctx, id)
+	if err != nil {
+		t.Fatalf("view: %v", err)
+	}
+	if len(view.DepartmentAccounts) != 1 || view.DepartmentAccounts[0].HeldAmount != 25 {
+		t.Fatalf("department account after closure: %+v", view.DepartmentAccounts)
+	}
+}
+
+func TestDepartmentQuotaSurvivesReconnection(t *testing.T) {
+	store := testStore(t)
+	from, to := activeWindow()
+	id := uniqueID(t)
+	mustCreate(t, store, id, 100, from, to)
+	ctx := context.Background()
+	if _, _, err := store.DisburseToDepartment(ctx, id, "disb-1", "dept-a", 40); err != nil {
+		t.Fatalf("disburse: %v", err)
+	}
+	if _, _, err := store.ReturnFromDepartment(ctx, id, "ret-1", "dept-a", 15); err != nil {
+		t.Fatalf("return: %v", err)
+	}
+	if _, _, err := store.DisburseToDepartment(ctx, id, "disb-2", "dept-b", 10); err != nil {
+		t.Fatalf("disburse: %v", err)
+	}
+
+	// A fresh pool over the same database simulates a service restart.
+	pool, err := pgxpool.New(ctx, os.Getenv("TEST_DATABASE_URL"))
+	if err != nil {
+		t.Fatalf("reconnect: %v", err)
+	}
+	defer pool.Close()
+	restarted := NewStore(pool)
+	view, err := restarted.GetView(ctx, id)
+	if err != nil {
+		t.Fatalf("view after restart: %v", err)
+	}
+	if len(view.DepartmentRecords) != 3 || len(view.DepartmentAccounts) != 2 {
+		t.Fatalf("department state lost across restart: %+v", view)
+	}
+	a, b := view.DepartmentAccounts[0], view.DepartmentAccounts[1]
+	if a.DepartmentID != "dept-a" || a.HeldAmount != 25 || a.DisbursedAmount != 40 || a.ReturnedAmount != 15 {
+		t.Fatalf("dept-a account lost across restart: %+v", a)
+	}
+	if b.DepartmentID != "dept-b" || b.HeldAmount != 10 {
+		t.Fatalf("dept-b account lost across restart: %+v", b)
+	}
+	// Identifiers still replay instead of re-applying, and the free pool is
+	// still enforced: 100 - 35 held = 65 free.
+	replay, created, err := restarted.DisburseToDepartment(ctx, id, "disb-1", "dept-a", 40)
+	if err != nil || created || replay.Kind != KindDisburse || replay.Amount != 40 {
+		t.Fatalf("disbursement replay after restart: %+v created=%v err=%v", replay, created, err)
+	}
+	if _, created, err := restarted.ReturnFromDepartment(ctx, id, "ret-1", "dept-a", 15); err != nil || created {
+		t.Fatalf("return replay after restart: created=%v err=%v", created, err)
+	}
+	_, _, err = restarted.DisburseToDepartment(ctx, id, "disb-3", "dept-b", 66)
+	wantCode(t, err, CodeInsufficientQuota)
+	if _, _, err := restarted.DisburseToDepartment(ctx, id, "disb-3", "dept-b", 65); err != nil {
+		t.Fatalf("disburse the remaining free pool after restart: %v", err)
+	}
+}

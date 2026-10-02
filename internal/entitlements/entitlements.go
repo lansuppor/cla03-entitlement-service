@@ -4,8 +4,10 @@
 // reversals of confirmed reservations, scheduled quota-total adjustments,
 // idempotent validity-window reschedules, immediate idempotent
 // adjustments of the seat total (seat allocation and recovery),
-// one-way expiry closure with a close-time accounting snapshot, and
-// caller-timed pause/resume of grant issuance, persisted in PostgreSQL.
+// one-way expiry closure with a close-time accounting snapshot,
+// caller-timed pause/resume of grant issuance, and idempotent department
+// quota disbursement and return against the free quota, persisted in
+// PostgreSQL.
 package entitlements
 
 import (
@@ -41,6 +43,8 @@ const (
 	CodeEntitlementPaused        = "entitlement_paused"
 	CodeEntitlementAlreadyPaused = "entitlement_already_paused"
 	CodeEntitlementNotPaused     = "entitlement_not_paused"
+	CodeDisbursementParamChanged = "disbursement_param_mismatch"
+	CodeReturnParamChanged       = "return_param_mismatch"
 )
 
 // Error is a domain failure with a stable machine-readable code.
@@ -76,6 +80,14 @@ const StatusClosed = "closed"
 const (
 	KindPause  = "pause"
 	KindResume = "resume"
+)
+
+// Department quota movement kinds: a disbursement allocates free quota to an
+// internal department, a return hands department-held quota back to the free
+// pool.
+const (
+	KindDisburse = "disburse"
+	KindReturn   = "return"
 )
 
 // Settlement actions.
@@ -197,6 +209,35 @@ type PauseResumeEvent struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// DepartmentQuotaRecord is one movement of quota between an entitlement's
+// free pool and an internal department, identified by the caller-supplied
+// business identifier, unique within the entitlement and shared across both
+// kinds (an identifier used for a disbursement cannot be reused for a return
+// with different data). A disbursement allocates free quota to the
+// department; a return hands department-held quota back to the free pool.
+// Neither kind creates a reservation or changes quota_total, used, unsettled
+// reserved or available quota — the movement only shifts quota between the
+// free pool and the department's holdings.
+type DepartmentQuotaRecord struct {
+	RecordID     string    `json:"record_id"`
+	DepartmentID string    `json:"department_id"`
+	Amount       int64     `json:"amount"`
+	Kind         string    `json:"type"` // "disburse" or "return"
+	CreatedAt    time.Time `json:"created_at"`
+}
+
+// DepartmentAccount is the per-department quota ledger derived from the
+// department quota records: HeldAmount is the quota the department currently
+// holds (disbursed minus returned), DisbursedAmount and ReturnedAmount are
+// the cumulative totals in each direction. A department that returned
+// everything stays listed with a zero holding and can be disbursed to again.
+type DepartmentAccount struct {
+	DepartmentID    string `json:"department_id"`
+	HeldAmount      int64  `json:"held_amount"`
+	DisbursedAmount int64  `json:"disbursed_amount"`
+	ReturnedAmount  int64  `json:"returned_amount"`
+}
+
 // adjustmentStatus derives the lifecycle state from the application
 // timestamp.
 func adjustmentStatus(appliedAt *time.Time) string {
@@ -221,6 +262,10 @@ func adjustmentStatus(appliedAt *time.Time) string {
 // carries the close-time accounting record (nil/empty before closure).
 // PauseResumeEvents lists every pause and resume in registration order; the
 // last entry determines whether issuance is currently paused.
+// DepartmentAccounts lists every department that ever received a
+// disbursement, with its current holding and cumulative disbursed and
+// returned totals; DepartmentQuotaRecords lists every disbursement and
+// return in creation order. Neither affects any quota or seat figure above.
 type View struct {
 	EntitlementID   string             `json:"entitlement_id"`
 	SeatsTotal      int64              `json:"seats_total"`
@@ -238,6 +283,9 @@ type View struct {
 	Adjustments     []Adjustment       `json:"adjustments"`
 	Reschedules     []Reschedule       `json:"reschedules"`
 	SeatAdjustments []SeatAdjustment   `json:"seat_adjustments"`
+
+	DepartmentAccounts []DepartmentAccount     `json:"department_accounts"`
+	DepartmentRecords  []DepartmentQuotaRecord `json:"department_quota_records"`
 }
 
 var identifierPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
@@ -357,7 +405,23 @@ CREATE TABLE IF NOT EXISTS pause_resume_events (
     PRIMARY KEY (entitlement_id, event_id)
 );
 CREATE INDEX IF NOT EXISTS idx_pause_resume_events_order
-    ON pause_resume_events (entitlement_id, created_at, event_id);`)
+    ON pause_resume_events (entitlement_id, created_at, event_id);
+-- Department quota movements: each row is one disbursement of free quota to
+-- an internal department or one return of department-held quota to the free
+-- pool. The business identifier is unique within an entitlement and shared
+-- across both kinds (an identifier denotes one movement, either a
+-- disbursement or a return); the kind is recorded on each row.
+CREATE TABLE IF NOT EXISTS department_quota_records (
+    entitlement_id TEXT NOT NULL REFERENCES entitlements (entitlement_id),
+    record_id      TEXT NOT NULL,
+    department_id  TEXT NOT NULL,
+    amount         BIGINT NOT NULL CHECK (amount > 0),
+    kind           TEXT NOT NULL CHECK (kind IN ('disburse', 'return')),
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (entitlement_id, record_id)
+);
+CREATE INDEX IF NOT EXISTS idx_department_quota_records_order
+    ON department_quota_records (entitlement_id, created_at, record_id);`)
 	if err != nil {
 		return fmt.Errorf("migrate schema: %w", err)
 	}
@@ -522,6 +586,34 @@ WHERE entitlement_id = $1 AND status <> 'released'`, entitlementID).Scan(&alloca
 		return 0, fmt.Errorf("sum allocated seats: %w", err)
 	}
 	return allocated, nil
+}
+
+// departmentHeldTotal sums the quota currently held by all departments of an
+// entitlement — every disbursement minus every return. The free pool a new
+// disbursement draws from is the available quota minus this total.
+func departmentHeldTotal(ctx context.Context, tx pgx.Tx, entitlementID string) (int64, error) {
+	var held int64
+	err := tx.QueryRow(ctx, `
+SELECT COALESCE(SUM(CASE WHEN kind = 'disburse' THEN amount ELSE -amount END), 0)
+FROM department_quota_records WHERE entitlement_id = $1`, entitlementID).Scan(&held)
+	if err != nil {
+		return 0, fmt.Errorf("sum department holdings: %w", err)
+	}
+	return held, nil
+}
+
+// departmentHeld sums the quota currently held by one department. A return
+// must never drop this below zero.
+func departmentHeld(ctx context.Context, tx pgx.Tx, entitlementID, departmentID string) (int64, error) {
+	var held int64
+	err := tx.QueryRow(ctx, `
+SELECT COALESCE(SUM(CASE WHEN kind = 'disburse' THEN amount ELSE -amount END), 0)
+FROM department_quota_records WHERE entitlement_id = $1 AND department_id = $2`,
+		entitlementID, departmentID).Scan(&held)
+	if err != nil {
+		return 0, fmt.Errorf("sum department holding: %w", err)
+	}
+	return held, nil
 }
 
 // applyDueAdjustments folds every adjustment whose effective time has arrived
@@ -1310,6 +1402,141 @@ func (s *Store) ResumeEntitlement(ctx context.Context, entitlementID, eventID st
 	return s.registerPauseResume(ctx, entitlementID, eventID, KindResume, at)
 }
 
+// registerDepartmentQuotaMovement is the shared body of DisburseToDepartment
+// and ReturnFromDepartment. The caller-supplied recordID is unique within the
+// entitlement and shared across both kinds: resubmitting the same identifier
+// with the same kind, department and amount returns the original record
+// without moving quota again (created=false); resubmitting it with a
+// different kind, department or amount fails without changing state. A
+// disbursement immediately occupies free quota — the available quota minus
+// what departments already hold — and fails as a whole when the free pool
+// cannot cover it; a return immediately hands quota back to the free pool
+// and fails as a whole when it would drop the department's holding below
+// zero. Neither kind creates a reservation or changes quota_total, used,
+// unsettled reserved or available quota, and neither is a grant issuance, so
+// the validity window, closure and the pause flag do not gate them — like
+// settlement and reversal, they stay allowed on a closed entitlement. Both
+// run under the per-entitlement row lock, serializing with every other flow;
+// like every other touch, the call first folds due adjustments and performs
+// the one-time closure if the validity end has passed.
+func (s *Store) registerDepartmentQuotaMovement(ctx context.Context, entitlementID, recordID, departmentID, kind string, amount int64) (DepartmentQuotaRecord, bool, error) {
+	if err := validIdentifier("record_id", recordID); err != nil {
+		return DepartmentQuotaRecord{}, false, err
+	}
+	if err := validIdentifier("department_id", departmentID); err != nil {
+		return DepartmentQuotaRecord{}, false, err
+	}
+	if amount <= 0 {
+		return DepartmentQuotaRecord{}, false, fail(CodeInvalidRequest, "amount is required and must be a positive integer")
+	}
+	mismatchCode := CodeDisbursementParamChanged
+	if kind == KindReturn {
+		mismatchCode = CodeReturnParamChanged
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return DepartmentQuotaRecord{}, false, fmt.Errorf("begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	ent, err := lockEntitlement(ctx, tx, entitlementID)
+	if err != nil {
+		return DepartmentQuotaRecord{}, false, err
+	}
+	if err := applyDueAdjustments(ctx, tx, &ent, entitlementID); err != nil {
+		return DepartmentQuotaRecord{}, false, err
+	}
+	if err := closeIfDue(ctx, tx, &ent, entitlementID); err != nil {
+		return DepartmentQuotaRecord{}, false, err
+	}
+
+	var existing DepartmentQuotaRecord
+	err = tx.QueryRow(ctx, `
+SELECT record_id, department_id, amount, kind, created_at
+FROM department_quota_records WHERE entitlement_id = $1 AND record_id = $2`,
+		entitlementID, recordID).
+		Scan(&existing.RecordID, &existing.DepartmentID, &existing.Amount, &existing.Kind, &existing.CreatedAt)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return DepartmentQuotaRecord{}, false, fmt.Errorf("load department quota record: %w", err)
+	}
+	if err == nil {
+		if existing.Kind != kind || existing.DepartmentID != departmentID || existing.Amount != amount {
+			return DepartmentQuotaRecord{}, false, fail(mismatchCode,
+				"record %q already exists with type %q, department_id %q and amount %d, not type %q, department_id %q and amount %d",
+				recordID, existing.Kind, existing.DepartmentID, existing.Amount, kind, departmentID, amount)
+		}
+		// An identical replay returns the original record and never moves
+		// quota again.
+		return existing, false, tx.Commit(ctx)
+	}
+
+	if kind == KindDisburse {
+		pending, err := pendingAmount(ctx, tx, entitlementID)
+		if err != nil {
+			return DepartmentQuotaRecord{}, false, err
+		}
+		held, err := departmentHeldTotal(ctx, tx, entitlementID)
+		if err != nil {
+			return DepartmentQuotaRecord{}, false, err
+		}
+		free := ent.quotaTotal - ent.usedAmount - pending - held
+		if amount > free {
+			return DepartmentQuotaRecord{}, false, fail(CodeInsufficientQuota,
+				"requested disbursement of %d but only %d free quota remains (%d of %d quota available, %d held by departments)",
+				amount, free, ent.quotaTotal-ent.usedAmount-pending, ent.quotaTotal, held)
+		}
+	} else {
+		held, err := departmentHeld(ctx, tx, entitlementID, departmentID)
+		if err != nil {
+			return DepartmentQuotaRecord{}, false, err
+		}
+		if held-amount < 0 {
+			return DepartmentQuotaRecord{}, false, fail(CodeInsufficientQuota,
+				"return of %d would drop the holding of department %q to %d", amount, departmentID, held-amount)
+		}
+	}
+
+	var created DepartmentQuotaRecord
+	err = tx.QueryRow(ctx, `
+INSERT INTO department_quota_records (entitlement_id, record_id, department_id, amount, kind)
+VALUES ($1, $2, $3, $4, $5)
+RETURNING record_id, department_id, amount, kind, created_at`,
+		entitlementID, recordID, departmentID, amount, kind).
+		Scan(&created.RecordID, &created.DepartmentID, &created.Amount, &created.Kind, &created.CreatedAt)
+	if err != nil {
+		return DepartmentQuotaRecord{}, false, fmt.Errorf("insert department quota record: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return DepartmentQuotaRecord{}, false, fmt.Errorf("commit department quota record: %w", err)
+	}
+	return created, true, nil
+}
+
+// DisburseToDepartment allocates free quota of an existing entitlement to an
+// internal department. The caller-supplied disbursementID is unique per
+// entitlement: the first submission records the disbursement and immediately
+// occupies free quota (created=true); resubmitting the same identifier with
+// the same department and amount returns the original record without
+// occupying quota again (created=false); resubmitting it with a different
+// department or amount fails without changing state. Quota a department has
+// returned is free again and can be disbursed once more. The disbursement
+// creates no reservation and changes no quota or seat figure.
+func (s *Store) DisburseToDepartment(ctx context.Context, entitlementID, disbursementID, departmentID string, amount int64) (DepartmentQuotaRecord, bool, error) {
+	return s.registerDepartmentQuotaMovement(ctx, entitlementID, disbursementID, departmentID, KindDisburse, amount)
+}
+
+// ReturnFromDepartment hands department-held quota of an existing
+// entitlement back to the free pool. The caller-supplied returnID is unique
+// per entitlement: the first submission records the return and immediately
+// frees the quota (created=true); resubmitting the same identifier with the
+// same department and amount returns the original record without freeing
+// quota again (created=false); resubmitting it with a different department
+// or amount fails without changing state. A return that would drop the
+// department's holding below zero fails as a whole and writes nothing.
+func (s *Store) ReturnFromDepartment(ctx context.Context, entitlementID, returnID, departmentID string, amount int64) (DepartmentQuotaRecord, bool, error) {
+	return s.registerDepartmentQuotaMovement(ctx, entitlementID, returnID, departmentID, KindReturn, amount)
+}
+
 // GetView returns the quota breakdown, reservation list, adjustment list
 // and reschedule list for an entitlement, consistent with the committed
 // state. Due adjustments are folded into the quota total as part of the
@@ -1486,6 +1713,54 @@ ORDER BY created_at, event_id`, entitlementID)
 		return View{}, fmt.Errorf("list pause/resume events: %w", err)
 	}
 	eventRows.Close()
+
+	recordRows, err := tx.Query(ctx, `
+SELECT record_id, department_id, amount, kind, created_at
+FROM department_quota_records WHERE entitlement_id = $1
+ORDER BY created_at, record_id`, entitlementID)
+	if err != nil {
+		return View{}, fmt.Errorf("list department quota records: %w", err)
+	}
+	view.DepartmentRecords = []DepartmentQuotaRecord{}
+	for recordRows.Next() {
+		var record DepartmentQuotaRecord
+		if err := recordRows.Scan(&record.RecordID, &record.DepartmentID, &record.Amount, &record.Kind, &record.CreatedAt); err != nil {
+			recordRows.Close()
+			return View{}, fmt.Errorf("scan department quota record: %w", err)
+		}
+		view.DepartmentRecords = append(view.DepartmentRecords, record)
+	}
+	if err := recordRows.Err(); err != nil {
+		recordRows.Close()
+		return View{}, fmt.Errorf("list department quota records: %w", err)
+	}
+	recordRows.Close()
+
+	accountRows, err := tx.Query(ctx, `
+SELECT department_id,
+       COALESCE(SUM(amount) FILTER (WHERE kind = 'disburse'), 0) AS disbursed,
+       COALESCE(SUM(amount) FILTER (WHERE kind = 'return'), 0) AS returned
+FROM department_quota_records WHERE entitlement_id = $1
+GROUP BY department_id
+ORDER BY department_id`, entitlementID)
+	if err != nil {
+		return View{}, fmt.Errorf("list department accounts: %w", err)
+	}
+	view.DepartmentAccounts = []DepartmentAccount{}
+	for accountRows.Next() {
+		var account DepartmentAccount
+		if err := accountRows.Scan(&account.DepartmentID, &account.DisbursedAmount, &account.ReturnedAmount); err != nil {
+			accountRows.Close()
+			return View{}, fmt.Errorf("scan department account: %w", err)
+		}
+		account.HeldAmount = account.DisbursedAmount - account.ReturnedAmount
+		view.DepartmentAccounts = append(view.DepartmentAccounts, account)
+	}
+	if err := accountRows.Err(); err != nil {
+		accountRows.Close()
+		return View{}, fmt.Errorf("list department accounts: %w", err)
+	}
+	accountRows.Close()
 
 	if err := tx.Commit(ctx); err != nil {
 		return View{}, fmt.Errorf("commit view: %w", err)

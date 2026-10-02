@@ -1,6 +1,6 @@
 # Entitlement service
 
-Go HTTP service for team service entitlements: seat-quota grants with idempotent reservations (each tagged with its owning internal department), confirm/release settlement, corrective reversals of confirmed reservations, scheduled quota-total adjustments, idempotent validity-window reschedules, immediate idempotent allocation and recovery of the entitlement's seats, one-way expiry closure with a close-time accounting snapshot, and caller-timed pause/resume of grant issuance, persisted in PostgreSQL. Requires Go 1.27.1 and PostgreSQL 18.6.
+Go HTTP service for team service entitlements: seat-quota grants with idempotent reservations (each tagged with its owning internal department), confirm/release settlement, corrective reversals of confirmed reservations, scheduled quota-total adjustments, idempotent validity-window reschedules, immediate idempotent allocation and recovery of the entitlement's seats, one-way expiry closure with a close-time accounting snapshot, caller-timed pause/resume of grant issuance, and idempotent disbursement and return of quota between the free pool and internal departments, persisted in PostgreSQL. Requires Go 1.27.1 and PostgreSQL 18.6.
 
 ```sh
 go mod download
@@ -136,6 +136,30 @@ Time rules (validated strictly, so a bad time fails with 400 `invalid_request` a
 
 While paused, new reservations are refused with 422 `entitlement_paused`. Confirmation and release of in-flight reservations and corrective reversals are unaffected by a pause; quota and seat adjustments are not issuance and remain allowed. After a resume, new reservations are accepted again, and a fresh pause is then permitted.
 
+### Disburse quota to a department
+
+`POST /entitlements/{entitlement_id}/disbursements`
+
+```json
+{"disbursement_id":"alloc-dept-2026-0007","department_id":"dept-platform","amount":40}
+```
+
+When operations or implementation hands part of the purchased quota down to an internal department, they disburse from the entitlement's free pool. `disbursement_id` is the caller-supplied business identifier, unique within the entitlement; `department_id` identifies the internal department and uses the same character rules as the other business identifiers; `amount` must be a positive integer. The first submission returns 201 with the record and immediately occupies free quota — the available quota minus what departments already hold. Resubmitting the same identifier with the same department and amount returns 200 with the original record and does not occupy quota again; resubmitting it with a different department or amount fails with 409 `disbursement_param_mismatch` and changes nothing. A missing or illegal identifier, department or amount fails with 400 `invalid_request`, an unknown entitlement with 404 `entitlement_not_found`, and a disbursement larger than the free pool fails as a whole with 422 `insufficient_quota` — every failure writes nothing.
+
+A disbursement creates no reservation and changes no quota or seat figure: `quota_total`, `used_amount`, `reserved_amount`, `available_amount` and `seats_total` all stay exactly as they were, and the reservation, settlement, release, reversal, quota adjustment, seat adjustment, reschedule and pause/resume flows and their idempotency rules are unaffected. Quota a department has returned is free again and can be disbursed once more.
+
+### Return quota from a department
+
+`POST /entitlements/{entitlement_id}/returns`
+
+```json
+{"return_id":"recall-dept-2026-0003","department_id":"dept-platform","amount":15}
+```
+
+When operations takes quota back from a department, the return hands department-held quota back to the free pool. `return_id` is the caller-supplied business identifier, unique within the entitlement (and sharing one namespace with the disbursement identifiers: a single identifier denotes one record, either a disbursement or a return). The first submission returns 201 with the record and immediately frees the quota. Resubmitting the same identifier with the same department and amount returns 200 with the original record and does not free quota again; resubmitting it with a different department or amount fails with 409 `return_param_mismatch` and changes nothing. A return that would drop the department's current holding below zero fails as a whole with 422 `insufficient_quota` and writes nothing; missing or illegal parameters fail with 400 `invalid_request`, an unknown entitlement with 404 `entitlement_not_found`.
+
+Both responses and the view's record list describe each movement with its business `record_id`, `department_id`, `amount`, `type` (`disburse` or `return`) and `created_at`. Disbursement and return are reconciliation, not grant issuance: like settlement and reversal they stay allowed after the entitlement closes, and they are never blocked by a pause.
+
 ### Query an entitlement
 
 `GET /entitlements/{entitlement_id}` returns 200 with the quota breakdown, reservation list, adjustment list, reschedule list and seat adjustment list:
@@ -167,11 +191,18 @@ While paused, new reservations are refused with 422 `entitlement_paused`. Confir
   ],
   "seat_adjustments": [
     {"seat_adjustment_id": "alloc-2026-0017", "delta": 20, "seat_total": 120, "created_at": "..."}
+  ],
+  "department_accounts": [
+    {"department_id": "dept-platform", "held_amount": 25, "disbursed_amount": 40, "returned_amount": 15}
+  ],
+  "department_quota_records": [
+    {"record_id": "alloc-dept-2026-0007", "department_id": "dept-platform", "amount": 40, "type": "disburse", "created_at": "..."},
+    {"record_id": "recall-dept-2026-0003", "department_id": "dept-platform", "amount": 15, "type": "return", "created_at": "..."}
   ]
 }
 ```
 
-`status` is `pending`, `active` or `expired` relative to the validity window, or `closed` once the entitlement has gone through its one-way expiry closure. When closed the view also carries `closed_at` and a `closure_snapshot` object with the close-time figures (seats total, quota total, used, unsettled reserved, available, the validity window and the close time); before closure both are omitted (`closure_snapshot` is empty). The snapshot is frozen at closure and is not updated by later settlements. Each reservation entry reports its business identifier, owning `department_id`, amount, lifecycle status (`pending`, `confirmed`, `released` for reservations; `reversed` for corrective reversals) and settlement timestamp. `used_amount` is confirmed quota minus effective reversals, so a reversed reservation leaves the original confirmation and the reversal both visible while the quota figures reflect only the net effect. Each adjustment entry reports its business identifier, delta, effective time and whether it is `pending` or `applied`; `quota_total`, `available_amount` and the other figures count only applied adjustments, so they always match the quota actually in force. Each reschedule entry reports its business identifier, the new start and end of the validity window, and its creation time, listed in creation order; the view's top-level `valid_from`, `valid_to` and window-relative status always reflect the latest reschedule that has taken effect (a closed entitlement stays `closed` regardless). Each seat adjustment entry reports its business identifier, the seat delta, its creation time and `seat_total`, the cumulative seat total after that adjustment — deltas summed in creation order on top of the entitlement's initial seats; the list is ordered by creation time. Seat adjustments move only `seats_total`, never any quota figure. `pause_resume_events` lists every pause and resume in registration order, each with its business `id`, `type` (`pause` or `resume`) and caller-supplied `at` time; it is empty (`[]`) when none have been registered.
+`status` is `pending`, `active` or `expired` relative to the validity window, or `closed` once the entitlement has gone through its one-way expiry closure. When closed the view also carries `closed_at` and a `closure_snapshot` object with the close-time figures (seats total, quota total, used, unsettled reserved, available, the validity window and the close time); before closure both are omitted (`closure_snapshot` is empty). The snapshot is frozen at closure and is not updated by later settlements. Each reservation entry reports its business identifier, owning `department_id`, amount, lifecycle status (`pending`, `confirmed`, `released` for reservations; `reversed` for corrective reversals) and settlement timestamp. `used_amount` is confirmed quota minus effective reversals, so a reversed reservation leaves the original confirmation and the reversal both visible while the quota figures reflect only the net effect. Each adjustment entry reports its business identifier, delta, effective time and whether it is `pending` or `applied`; `quota_total`, `available_amount` and the other figures count only applied adjustments, so they always match the quota actually in force. Each reschedule entry reports its business identifier, the new start and end of the validity window, and its creation time, listed in creation order; the view's top-level `valid_from`, `valid_to` and window-relative status always reflect the latest reschedule that has taken effect (a closed entitlement stays `closed` regardless). Each seat adjustment entry reports its business identifier, the seat delta, its creation time and `seat_total`, the cumulative seat total after that adjustment — deltas summed in creation order on top of the entitlement's initial seats; the list is ordered by creation time. Seat adjustments move only `seats_total`, never any quota figure. `pause_resume_events` lists every pause and resume in registration order, each with its business `id`, `type` (`pause` or `resume`) and caller-supplied `at` time; it is empty (`[]`) when none have been registered. `department_accounts` lists every department that ever received a disbursement, ordered by department identifier, with its current `held_amount` (disbursed minus returned — a department that returned everything stays listed with a zero holding) and the cumulative `disbursed_amount` and `returned_amount`. `department_quota_records` lists every disbursement and return in creation order, each with its business `record_id`, `department_id`, `amount`, `type` (`disburse` or `return`) and `created_at`; both lists are empty (`[]`) when no movement has been recorded. Department movements never change any quota or seat figure, so all figures above ignore them.
 
 ### Error codes
 
@@ -195,10 +226,12 @@ While paused, new reservations are refused with 422 `entitlement_paused`. Confir
 | `entitlement_paused` | 422 | New reservation refused because issuance is paused |
 | `entitlement_already_paused` | 409 | Pause requested on an entitlement that is already paused |
 | `entitlement_not_paused` | 409 | Resume requested on an entitlement that is not paused |
+| `disbursement_param_mismatch` | 409 | Disbursement identifier reused with a different department or amount |
+| `return_param_mismatch` | 409 | Return identifier reused with a different department or amount |
 
 ## Consistency
 
-Concurrent reservations, confirmations, releases, reversals, adjustments, reschedules and seat adjustments on the same entitlement are serialized with a row lock in PostgreSQL, so used quota plus unsettled reservations never exceeds the total quota, the seat total never drops below the seats allocated to departments, repeated requests never grant, refund, adjust quota, rewrite the validity window or move the seat total twice, and failed requests leave no partial results. A reschedule only rewrites `valid_from`/`valid_to` — it never touches a quota figure, a reservation, a reversal or an adjustment record, and adjustments still apply solely by their own effective time. A seat adjustment only rewrites `seats_total` — it never touches a quota figure, a reservation, a reversal, a quota adjustment or a reschedule; the cumulative `seat_total` stored on each record always matches the entitlement's current `seats_total`. Due quota adjustments are folded into the quota total inside the same lock — by whichever operation or query touches the entitlement first after the effective time — so every adjustment applies exactly once and a decrease never crowds out occupied quota. Expiry closure happens in that same lock, on the first write or view after `valid_to`: it stamps one `closed_at` and inserts one closure snapshot atomically, so concurrent or repeated touches close it exactly once, the snapshot reads the figures actually in force at that instant, and the close either fully happens or not at all. Closure, pause and resume serialize with reservations, settlements, reversals, adjustments, reschedules and seat adjustments on the same row lock; pause and resume change only the pause flag and append their event records, never a quota figure, seat figure or the window, and failed requests leave no partial results. All state lives in PostgreSQL, so a restart preserves every quota and seat figure, reservation including its owning department, reversal record, adjustment record including its applied or pending state, reschedule record including the rescheduled window, every seat adjustment including its cumulative total, the closed state with its close time and frozen snapshot, and the full pause/resume history including whether issuance is currently paused.
+Concurrent reservations, confirmations, releases, reversals, adjustments, reschedules and seat adjustments on the same entitlement are serialized with a row lock in PostgreSQL, so used quota plus unsettled reservations never exceeds the total quota, the seat total never drops below the seats allocated to departments, repeated requests never grant, refund, adjust quota, rewrite the validity window or move the seat total twice, and failed requests leave no partial results. A reschedule only rewrites `valid_from`/`valid_to` — it never touches a quota figure, a reservation, a reversal or an adjustment record, and adjustments still apply solely by their own effective time. A seat adjustment only rewrites `seats_total` — it never touches a quota figure, a reservation, a reversal, a quota adjustment or a reschedule; the cumulative `seat_total` stored on each record always matches the entitlement's current `seats_total`. Due quota adjustments are folded into the quota total inside the same lock — by whichever operation or query touches the entitlement first after the effective time — so every adjustment applies exactly once and a decrease never crowds out occupied quota. Expiry closure happens in that same lock, on the first write or view after `valid_to`: it stamps one `closed_at` and inserts one closure snapshot atomically, so concurrent or repeated touches close it exactly once, the snapshot reads the figures actually in force at that instant, and the close either fully happens or not at all. Closure, pause and resume serialize with reservations, settlements, reversals, adjustments, reschedules and seat adjustments on the same row lock; pause and resume change only the pause flag and append their event records, never a quota figure, seat figure or the window, and failed requests leave no partial results. Department disbursements and returns run on that same row lock too: a disbursement occupies free quota (available quota minus department holdings) only when the pool covers it, a return never drops a department's holding below zero, replays never occupy or free quota twice, and neither movement ever touches a quota figure, a seat figure, a reservation or any other record. All state lives in PostgreSQL, so a restart preserves every quota and seat figure, reservation including its owning department, reversal record, adjustment record including its applied or pending state, reschedule record including the rescheduled window, every seat adjustment including its cumulative total, the closed state with its close time and frozen snapshot, the full pause/resume history including whether issuance is currently paused, and every department quota record with the per-department holdings derived from it.
 
 The local setup uses a trusted loopback connection and C collation without ICU. Use separate database directories, database ports and HTTP ports when running multiple copies.
 
@@ -423,3 +456,44 @@ curl -s 127.0.0.1:8080/entitlements/team-sigma
 ```
 
 After restarting the server, `GET /entitlements/team-sigma` still shows the same `pause_resume_events` and the current paused flag; `freeze-1` replays as 200 without taking effect again, and resuming a persisted pause still works.
+
+## Verifying the department disbursement and return flow
+
+With the server running as above, the full disburse/return cycle can be exercised with curl:
+
+```sh
+# 100 seats/quota; hold 30 with an in-flight reservation (available 70).
+curl -s -X POST 127.0.0.1:8080/entitlements -d '{"entitlement_id":"team-eta","quota_total":100,"valid_from":"2026-01-01T00:00:00Z","valid_to":"2027-01-01T00:00:00Z"}'
+curl -s -X POST 127.0.0.1:8080/entitlements/team-eta/reservations -d '{"reservation_id":"sub-e-001","department_id":"dept-ops","amount":30}'
+
+# Disburse 40 to dept-platform: 201, the free pool drops to 70 - 40 = 30.
+curl -s -X POST 127.0.0.1:8080/entitlements/team-eta/disbursements -d '{"disbursement_id":"alloc-e-001","department_id":"dept-platform","amount":40}'
+# The identical replay returns 200 with the original record and occupies nothing again.
+curl -s -X POST 127.0.0.1:8080/entitlements/team-eta/disbursements -d '{"disbursement_id":"alloc-e-001","department_id":"dept-platform","amount":40}'
+# Same identifier with different parameters fails atomically.
+curl -s -X POST 127.0.0.1:8080/entitlements/team-eta/disbursements -d '{"disbursement_id":"alloc-e-001","department_id":"dept-platform","amount":50}'  # 409 disbursement_param_mismatch
+# The free pool is 30, so 31 fails and writes nothing; 30 succeeds.
+curl -s -X POST 127.0.0.1:8080/entitlements/team-eta/disbursements -d '{"disbursement_id":"alloc-e-002","department_id":"dept-support","amount":31}'   # 422 insufficient_quota
+curl -s -X POST 127.0.0.1:8080/entitlements/team-eta/disbursements -d '{"disbursement_id":"alloc-e-002","department_id":"dept-support","amount":30}'   # 201
+
+# Return 15 from dept-platform: 201, its holding drops to 25 and the free pool rises to 15.
+curl -s -X POST 127.0.0.1:8080/entitlements/team-eta/returns -d '{"return_id":"recall-e-001","department_id":"dept-platform","amount":15}'
+curl -s -X POST 127.0.0.1:8080/entitlements/team-eta/returns -d '{"return_id":"recall-e-001","department_id":"dept-platform","amount":15}'            # 200, original record
+curl -s -X POST 127.0.0.1:8080/entitlements/team-eta/returns -d '{"return_id":"recall-e-001","department_id":"dept-platform","amount":10}'            # 409 return_param_mismatch
+# Returning more than the 25 held fails as a whole; returned quota can be disbursed again.
+curl -s -X POST 127.0.0.1:8080/entitlements/team-eta/returns -d '{"return_id":"recall-e-002","department_id":"dept-platform","amount":26}'            # 422 insufficient_quota
+curl -s -X POST 127.0.0.1:8080/entitlements/team-eta/disbursements -d '{"disbursement_id":"alloc-e-003","department_id":"dept-ops","amount":15}'      # 201
+
+# The view shows the department ledger and the record list; quota figures never moved.
+curl -s 127.0.0.1:8080/entitlements/team-eta
+# quota_total 100, reserved_amount 30, available_amount 70; department_accounts:
+#   dept-platform held 25 (disbursed 40, returned 15), dept-support held 30, dept-ops held 15
+# department_quota_records lists alloc-e-001, alloc-e-002, recall-e-001, alloc-e-003 in creation order.
+
+# Bad input and unknown targets use the same stable error envelope.
+curl -s -X POST 127.0.0.1:8080/entitlements/team-eta/disbursements -d '{"disbursement_id":"bad","department_id":"dept-ops"}'                            # 400 invalid_request
+curl -s -X POST 127.0.0.1:8080/entitlements/team-eta/returns -d '{"return_id":"bad","department_id":"dept ops!","amount":1}'                            # 400 invalid_request
+curl -s -X POST 127.0.0.1:8080/entitlements/team-missing/disbursements -d '{"disbursement_id":"d1","department_id":"dept-ops","amount":1}'              # 404 entitlement_not_found
+```
+
+After restarting the server (Ctrl+C, then the same `go run` command), `GET /entitlements/team-eta` still shows the same `department_accounts` and `department_quota_records`; replaying `alloc-e-001` or `recall-e-001` with their exact original parameters returns 200 with the original record and moves nothing again.

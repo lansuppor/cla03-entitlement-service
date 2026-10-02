@@ -21,6 +21,8 @@ type Service interface {
 	CreateSeatAdjustment(ctx context.Context, entitlementID, seatAdjustmentID string, delta int64) (entitlements.SeatAdjustment, bool, error)
 	PauseEntitlement(ctx context.Context, entitlementID, eventID string, at time.Time) (entitlements.PauseResumeEvent, bool, error)
 	ResumeEntitlement(ctx context.Context, entitlementID, eventID string, at time.Time) (entitlements.PauseResumeEvent, bool, error)
+	DisburseToDepartment(ctx context.Context, entitlementID, disbursementID, departmentID string, amount int64) (entitlements.DepartmentQuotaRecord, bool, error)
+	ReturnFromDepartment(ctx context.Context, entitlementID, returnID, departmentID string, amount int64) (entitlements.DepartmentQuotaRecord, bool, error)
 	GetView(ctx context.Context, entitlementID string) (entitlements.View, error)
 }
 
@@ -51,6 +53,8 @@ func New(checkDatabase func(context.Context) error, service Service) http.Handle
 	mux.HandleFunc("POST /entitlements/{entitlementID}/seat-adjustments", h.createSeatAdjustment)
 	mux.HandleFunc("POST /entitlements/{entitlementID}/pauses", h.pauseEntitlement)
 	mux.HandleFunc("POST /entitlements/{entitlementID}/resumes", h.resumeEntitlement)
+	mux.HandleFunc("POST /entitlements/{entitlementID}/disbursements", h.createDisbursement)
+	mux.HandleFunc("POST /entitlements/{entitlementID}/returns", h.createReturn)
 	return mux
 }
 
@@ -268,6 +272,68 @@ func (h *handlers) createSeatAdjustment(w http.ResponseWriter, r *http.Request) 
 	respondJSON(w, status, adjustment)
 }
 
+type createDisbursementRequest struct {
+	DisbursementID string `json:"disbursement_id"`
+	DepartmentID   string `json:"department_id"`
+	Amount         *int64 `json:"amount"`
+}
+
+func (h *handlers) createDisbursement(w http.ResponseWriter, r *http.Request) {
+	var req createDisbursementRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	if req.Amount == nil {
+		respondError(w, &entitlements.Error{
+			Code:    entitlements.CodeInvalidRequest,
+			Message: "amount is required and must be a positive integer",
+		})
+		return
+	}
+	record, created, err := h.service.DisburseToDepartment(
+		r.Context(), r.PathValue("entitlementID"), req.DisbursementID, req.DepartmentID, *req.Amount)
+	if err != nil {
+		respondError(w, err)
+		return
+	}
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	respondJSON(w, status, record)
+}
+
+type createReturnRequest struct {
+	ReturnID     string `json:"return_id"`
+	DepartmentID string `json:"department_id"`
+	Amount       *int64 `json:"amount"`
+}
+
+func (h *handlers) createReturn(w http.ResponseWriter, r *http.Request) {
+	var req createReturnRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	if req.Amount == nil {
+		respondError(w, &entitlements.Error{
+			Code:    entitlements.CodeInvalidRequest,
+			Message: "amount is required and must be a positive integer",
+		})
+		return
+	}
+	record, created, err := h.service.ReturnFromDepartment(
+		r.Context(), r.PathValue("entitlementID"), req.ReturnID, req.DepartmentID, *req.Amount)
+	if err != nil {
+		respondError(w, err)
+		return
+	}
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	respondJSON(w, status, record)
+}
+
 func (h *handlers) getEntitlement(w http.ResponseWriter, r *http.Request) {
 	view, err := h.service.GetView(r.Context(), r.PathValue("entitlementID"))
 	if err != nil {
@@ -374,6 +440,8 @@ var errorStatus = map[string]int{
 	entitlements.CodeEntitlementAlreadyPaused: http.StatusConflict,
 	entitlements.CodeEntitlementNotPaused:     http.StatusConflict,
 	entitlements.CodeEntitlementPaused:        http.StatusUnprocessableEntity,
+	entitlements.CodeDisbursementParamChanged: http.StatusConflict,
+	entitlements.CodeReturnParamChanged:       http.StatusConflict,
 }
 
 func respondError(w http.ResponseWriter, err error) {
